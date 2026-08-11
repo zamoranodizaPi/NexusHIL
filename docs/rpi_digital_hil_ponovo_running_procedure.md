@@ -20,11 +20,11 @@ problema para nada de lo de abajo, porque cada pieza necesita una red distinta:
 - **La Secuencia Automatica Guiada de la web de la Raspberry** solo mira senales GPIO
   (`motor_run`, `relay_56k`, `relay_fax`, `fault_out`) -- nunca llama a la API HTTP de
   la PZ. Le alcanza con el cableado fisico, sin importar en que red este la Raspberry.
-- **La correccion de permisivos** se hace por HTTP contra la web de la PZ (ver Paso 0
-  mas abajo) -- confirmado que **si hay acceso web a la PZ** (por la red que sea,
-  no tiene que ser la misma de la Raspberry; lo puede correr cualquier dispositivo que
-  llegue a esa IP, por ejemplo la notebook del tecnico). Con eso alcanza, es la via ya
-  probada hoy de punta a punta.
+- **La correccion de permisivos** se hace contra la web de la PZ (ver Paso 0 mas
+  abajo -- metodo elegido: tildar `Bypass Plant Fault` en `Ajustes`) -- confirmado que
+  **si hay acceso web a la PZ** (por la red que sea, no tiene que ser la misma de la
+  Raspberry; lo puede usar cualquier dispositivo que llegue a esa IP, por ejemplo la
+  notebook del tecnico). Con eso alcanza, es la via ya probada hoy de punta a punta.
 
 **Cableado (siempre):** conectar Raspberry <-> PZ segun el mapa de conexion antes de
 usar la Secuencia Automatica Guiada.
@@ -356,44 +356,42 @@ curl: `param set 13 255`, `param set 14 255`, `param set 15 0`, `param apply`. E
 funcionalmente equivalente (confirmado por RTL: los 2 campos que esa via no toca no
 los usa ninguna logica real) y no depende de ninguna red.**
 
-Con red disponible, hay dos formas equivalentes de aplicar el mismo fix -- por curl,
-o directo en la propia pantalla de Ajustes de la web de la PZ (sirve tambien para
-verificar visualmente, ya que ahi se ve el mismo error `AXI_APPLY_FAILED` que reporta
-la API):
+**Metodo elegido para las pruebas de este HIL: `Bypass Plant Fault` desde la propia
+web de la PZ.** Menu lateral `CONFIGURACION -> Ajustes`, bajar hasta la seccion
+`PERMISSIVES - TESTING BYPASS` y tildar `Bypass Plant Fault`, despues `Apply`:
 
-```powershell
-curl.exe -u operator:SIE2 -H "Content-Type: application/json" -X POST --data-raw "{\"permissive_enable_mask\":255,\"permissive_required_start_mask\":131,\"permissive_required_run_mask\":229,\"permissive_active_high_mask\":255,\"permissive_bypass_mask\":0}" http://192.168.1.50/api/settings/save
-```
+![Seccion PERMISSIVES - TESTING BYPASS de Ajustes, con los 4 checkboxes de bypass](images/pz_web_ajustes_permissives_bypass.png)
 
-**Por la web de la PZ:** menu lateral `CONFIGURACION -> Ajustes`. Arriba de la
-pantalla estan los botones `Apply` / `Save` / `Reset` / `Export` -- el mismo error
-`AXI_APPLY_FAILED` que reporta el curl aparece ahi tambien en rojo (confirma que no
+Por RTL, eso fuerza `plant_fault_eff=0` directamente --
+`plant_fault_eff = (!permissive_enable_mask[7] || permissive_bypass_mask[7]) ? 1'b0 : plant_fault_f`
+(`pz_sync_control_axi_top.v:1177`) -- sin importar el problema de polaridad de
+`permissive_active_high_mask`. Confirmar con `curl.exe http://192.168.1.50/status`
+(o el propio Dashboard) que quedo `fault_active:false`.
+
+**Advertencia de la propia pantalla, real:** bypass deja esa proteccion deshabilitada
+mientras el checkbox siga tildado -- valido para banco/HIL, **no usar en operacion
+real** con motor conectado.
+
+Los botones `Apply` / `Save` / `Reset` / `Export` estan arriba de la misma pantalla --
+ahi tambien aparece en rojo el mismo error `AXI_APPLY_FAILED` que reporta la API (no
 es un problema de la llamada HTTP en si, es el mismo bug de fondo visible desde
 cualquier lado):
 
 ![Pantalla de Ajustes de la PZ -- botones Apply/Save/Reset/Export y el error AXI_APPLY_FAILED](images/pz_web_ajustes_apply_save.png)
 
-Bajando en esa misma pantalla esta la seccion `PERMISSIVES - TESTING BYPASS`, con
-checkboxes de bypass por senal (Thermal OK, Exciter Ready, Full Volts, Plant Fault):
+**Bug conocido, sin arreglar todavia:** `Apply`/`Save` casi siempre terminan en
+`AXI_APPLY_FAILED` -- ignorar ese error, el valor SI queda aplicado en vivo, pero
+**nunca se guarda en la SD**, asi que **hay que repetir este paso despues de cada
+power-cycle de la PZ**, no solo la primera vez.
 
-![Seccion PERMISSIVES - TESTING BYPASS de Ajustes, con los 4 checkboxes de bypass](images/pz_web_ajustes_permissives_bypass.png)
+**Alternativa para pruebas que deban parecerse a la operacion real** (deja las
+protecciones reales activas, en vez de bypasear `plant_fault`) -- el fix completo de
+los 5 campos de permisivos, por curl o por UART si no hay red hacia la PZ (ver
+"Preparativos para un sitio remoto" al inicio de este documento):
 
-**Atajo mas simple para banco/HIL (NO usar en operacion real, la propia pantalla lo
-advierte):** tildar `Bypass Plant Fault` fuerza `plant_fault_eff=0` en el RTL sin
-importar el problema de polaridad de `permissive_active_high_mask` --
-`plant_fault_eff = (!permissive_enable_mask[7] || permissive_bypass_mask[7]) ? 1'b0 : plant_fault_f`
-(`pz_sync_control_axi_top.v:1177`). Evita todo el fix de permisivos para las pruebas
-de este HIL, a costa de dejar esa proteccion real deshabilitada mientras el bypass
-siga tildado -- por eso la advertencia en pantalla. Usar el fix de permisivos completo
-(arriba) para cualquier prueba que deba parecerse a la operacion real.
-
-**Bug conocido, sin arreglar todavia:** esta llamada casi siempre responde
-`{"ok":false,"error":"AXI_APPLY_FAILED"}` (HTTP 500) -- ignorar ese error, el valor SI
-queda aplicado en vivo (confirmarlo con `curl.exe http://192.168.1.50/status`, tiene
-que dar `fault_active:false`). Lo que SI es real: nunca llega a guardarse en la SD
-(`nexus_settings_store_save()` no se ejecuta si falla la verificacion AXI previa), asi
-que **hay que repetir este paso despues de cada power-cycle de la PZ**, no solo la
-primera vez.
+```powershell
+curl.exe -u operator:SIE2 -H "Content-Type: application/json" -X POST --data-raw "{\"permissive_enable_mask\":255,\"permissive_required_start_mask\":131,\"permissive_required_run_mask\":229,\"permissive_active_high_mask\":255,\"permissive_bypass_mask\":0}" http://192.168.1.50/api/settings/save
+```
 
 ### 1. Ponovo estable
 
