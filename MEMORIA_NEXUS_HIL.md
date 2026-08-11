@@ -363,3 +363,10 @@ Pendiente:
 - Verificar que `relay_56k` suba a 1.
 - Ejecutar la secuencia START -> `motor_run` -> `full_volts` -> descarga -> campo -> sincronismo -> RUNNING.
 
+## Actualizacion 2026-08-11 (segunda sesion)
+
+- Correccion de permisivos aplicada y confirmada: `fault_active` paso a `false`, PZ alcanzo `fsm_state=1 (READY)` con `relay_56k=true`. El repositorio ahora vive en GitHub (`https://github.com/zamoranodizaPi/NexusHIL`, rama `main`) y `/home/pi/NexusHIL` en la Raspberry es un clone real de ese repo (antes era copia manual sin git).
+- Se dio START y se llego a la etapa de descarga; la PZ cayo en `fault_code=4 DISCHARGE_CIRCUIT` (fault real, no de polaridad). Coincidio en el tiempo con una prueba remota de `ARM`+`READY` vía la web del HIL que resetea `discharge_current_present` a 0 -- pudo haber contribuido. Ver la nueva seccion "Coordinacion antes de operar el HIL remoto" en `docs/rpi_digital_hil_ponovo_running_procedure.md`.
+- Equipo en reinicio para retomar la secuencia completa desde cero.
+- Pendiente siguiente: repetir Paso 1-8 de `docs/rpi_digital_hil_ponovo_running_procedure.md` de forma coordinada (una sola persona operando el HIL a la vez), prestando especial atencion a mantener `discharge_current_present=ON` sostenido durante toda la etapa de descarga.
+

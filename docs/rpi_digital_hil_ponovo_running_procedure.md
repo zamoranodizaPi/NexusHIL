@@ -10,6 +10,12 @@ Este procedimiento combina:
 
 La Raspberry no genera voltajes ni corrientes. La Ponovo entrega las senales analogicas hacia el acondicionamiento/ADS/PZ. No conectar salidas Ponovo directamente al ADC/ADS si no existe etapa de acondicionamiento, aislamiento y escalamiento validada.
 
+## Coordinacion antes de operar el HIL remoto
+
+`SAFE_STOP`, `READY` y cualquier boton de senal en la web de la Raspberry cambian salidas fisicas reales hacia la PZ. `READY` en particular vuelve a poner en 0 `full_volts`, `field_current_present`, `discharge_current_present` y `motor_synchronized` -- si alguien esta en medio de una secuencia manual en el banco (por ejemplo en la etapa de descarga con `discharge_current_present=ON`), una llamada remota a `READY`/`SAFE_STOP` le resetea esas senales sin aviso y puede contribuir a una falla real (ya paso: una prueba remota de `ARM`+`READY` coincidio con una prueba manual en curso y la PZ cayo en `DISCHARGE_CIRCUIT`).
+
+Regla: antes de tocar la web del HIL desde una sesion remota (incluyendo pedidos a un asistente con acceso a la API), confirmar primero si hay alguien operando fisicamente el banco en ese momento.
+
 ## Mapa de canales analogicos ADS/Ponovo
 
 El firmware COMTRADE/HMI etiqueta los canales ADS asi:
@@ -93,6 +99,8 @@ permissive_required_start_mask = 229
 permissive_required_run_mask = 255
 permissive_active_high_mask = 0
 ```
+
+**Actualizacion 2026-08-11: corregido y confirmado.** Se aplico el POST de abajo contra la PZ de banco. Resultado verificado en vivo: `fault_active` paso a `false`, `fsm_state` paso a `1` (`READY`), `relay_56k=true`. La PZ paso a mostrar `severity=WARNING` ("SELF-TEST DEGRADED") en vez de `FAULT` -- eso es esperado y es un aviso distinto (ver `MEMORIA_NEXUS_HIL.md`, no bloquea README ni START), causado por `using_default_credentials=true` (contrasena de operador todavia de fabrica). No confundir ese warning con el fault de permisivos ya resuelto.
 
 Eso indica medicion analogica sana, pero permisivos guardados con polaridad incorrecta o valores corridos. Para este HIL digital los valores esperados son:
 
@@ -193,7 +201,9 @@ En la interfaz web Raspberry:
 
 ### Paso 3 - Orden START desde PZ
 
-1. Dar START desde HMI/API/operador de Nexus Sync.
+**Importante: START/RUN se da fisicamente en el banco (HMI local de la PZ), nunca por API/remoto sin alguien presente controlando el equipo.** Ver "Coordinacion antes de operar el HIL remoto" al inicio de este documento.
+
+1. Dar START desde HMI/operador de Nexus Sync, en persona.
 2. En la interfaz web verificar `motor_run = ON`.
 3. Verificar si `dst_cmd = ON`; esto indica que la PZ esta pidiendo etapa de descarga/arranque.
 
@@ -274,7 +284,7 @@ Valor inicial del tren de pulsos: `5 Hz`.
 |---|---|
 | No entra READY | Usar la tabla "Diagnostico si no entra READY"; READY requiere medicion ADS valida y permisivos digitales |
 | No aparece `motor_run` | START real desde HMI/API, estado de fault/lockout |
-| Se queda en descarga | `full_volts`, `discharge_current_present`, CH7, tren `discharge_extinction_pulse`, `dst_cmd` |
+| Se queda en descarga | `full_volts`, `discharge_current_present`, CH7, tren `discharge_extinction_pulse`, `dst_cmd`. Falla real observada en banco: `fault_code=4 DISCHARGE_CIRCUIT` -- revisar que `discharge_current_present` este realmente en `ON` (o CH7 sobre umbral) de forma sostenida durante toda la etapa, no solo un instante; si algo (incluida una llamada remota a `READY`/`SAFE_STOP`) lo vuelve a poner en 0 a mitad de la secuencia, la PZ la interpreta como perdida del circuito de descarga |
 | No habilita campo | `field_enable`, condicion de descarga, `field_apply_ok`, PLL/ZC/sync config |
 | Falla al activar campo | CH6/`field_current_present`, protecciones, `fault_out`, codigo de falla |
 | No declara RUNNING | `motor_synchronized`, secuencia/frecuencia Ponovo, `relay_fax`, pull-out |
