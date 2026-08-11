@@ -254,6 +254,157 @@ Valor inicial del tren de pulsos: `5 Hz`.
    - `motor_synchronized = ON`.
 3. Si `fault_out = ON`, detener la prueba y revisar el codigo de falla en HMI/API.
 
+## Secuencia exacta verificada en banco -- llego a RUNNING sostenido (2026-08-11)
+
+Esto es una receta literal, con comandos, de la corrida que efectivamente llego a
+`fsm_state=7 (RUNNING)` sostenido (`relay_fax=true`, `fault_code=0`) en el banco de
+`192.168.1.50`. Combina los Pasos 1-8 de arriba con el timing exacto que hizo falta --
+sin este timing, la secuencia falla de forma reproducible en 3 puntos distintos
+(documentados abajo). Usar esto como receta directa; usar los Pasos 1-8 de arriba
+como referencia de POR QUE cada cosa hace falta.
+
+**Que es por pantalla tactil de la PZ (fisico, en persona) y que es por la web del HIL:**
+
+| Accion | Donde | Quien |
+|---|---|---|
+| Corregir permisivos (una vez por cada power-cycle de la PZ, no persiste) | API/curl | Tecnico remoto, por red |
+| ARMAR + READY | Web HIL (`192.168.1.120:8080`) | Tecnico remoto, por red |
+| **START** | **Pantalla tactil HMI de la PZ** | **Alguien fisicamente en el banco** |
+| full_volts, discharge_current_present, pulso, field_current_present, motor_synchronized | Web HIL | Tecnico remoto, por red |
+| **ACK y RESET despues de cualquier falla** | **Pantalla tactil HMI de la PZ** | **Alguien fisicamente en el banco** |
+| SAFE_STOP | Web HIL | Tecnico remoto, por red |
+
+O sea: hace falta una persona en el banco solo para START/ACK/RESET (los comandos que
+mueven la planta de verdad) -- todo lo demas se puede operar remoto desde la web del
+HIL. Ver tambien "Coordinacion antes de operar el HIL remoto" al inicio de este
+documento: nunca tocar la web del HIL mientras la persona en el banco esta en medio de
+una secuencia manual.
+
+### 0. Corregir permisivos (repetir despues de CADA reinicio de la PZ)
+
+```powershell
+curl.exe -u operator:SIE2 -H "Content-Type: application/json" -X POST --data-raw "{\"permissive_enable_mask\":255,\"permissive_required_start_mask\":131,\"permissive_required_run_mask\":229,\"permissive_active_high_mask\":255,\"permissive_bypass_mask\":0}" http://192.168.1.50/api/settings/save
+```
+
+**Bug conocido, sin arreglar todavia:** esta llamada casi siempre responde
+`{"ok":false,"error":"AXI_APPLY_FAILED"}` (HTTP 500) -- ignorar ese error, el valor SI
+queda aplicado en vivo (confirmarlo con `curl.exe http://192.168.1.50/status`, tiene
+que dar `fault_active:false`). Lo que SI es real: nunca llega a guardarse en la SD
+(`nexus_settings_store_save()` no se ejecuta si falla la verificacion AXI previa), asi
+que **hay que repetir este paso despues de cada power-cycle de la PZ**, no solo la
+primera vez.
+
+### 1. Ponovo estable
+
+Vab/Vbc/Vca balanceados a 60 Hz, corrientes Ia/Ib/Ic en 0 A. Confirmar
+`signal_present=true`, `freq_valid=true`, `sync_reference_ok=true` en
+`http://192.168.1.50/api/measurement/status`.
+
+### 2. ARMAR + READY (web HIL)
+
+```powershell
+$armBody = @{ gnd=$true; no_5v=$true; power_disabled=$true; series_resistors=$true } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/arm" -Method POST -Body $armBody -ContentType "application/json"
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/ready" -Method POST -Body "{}" -ContentType "application/json"
+```
+
+Confirmar `relay_56k:true` en `http://192.168.1.50/status`.
+
+### 3. START -- fisico, en el HMI de la PZ
+
+La persona en el banco toca START en la pantalla. Confirmar `motor_run:true` en
+`/status` (`fsm_state` pasa a `2`).
+
+### 4/5. full_volts + descarga + pulso -- TODO JUNTO, sin pausas entre medio
+
+**Punto de falla real #1:** el reloj de 3 segundos (`disc_current_on_timeout_ms=3000`
+en el RTL, NO expuesto en `/api/settings`, no se puede cambiar por API) empieza a
+contar en el instante en que `full_volts` se activa (ahi la FSM entra a
+`WAIT_DISCHARGE`). Si `discharge_current_present` y el pulso se activan en un mensaje
+o llamada separada más tarde, ese hueco de tiempo se come el margen y sale
+`fault_code=4 DISCHARGE_CIRCUIT`. Por eso estos tres van en la misma tanda de
+comandos, sin esperar confirmacion entre uno y otro:
+
+**Punto de falla real #2:** el pulso `discharge_extinction_pulse` pasa por un filtro
+de debounce de 100ms en el RTL (`pz_sync_control_axi_top.v:1124`,
+`.DEBOUNCE_MS(100)`). A 5 Hz (semiperiodo = 100ms exactos) casi todos los flancos se
+descartan como rebote y la frecuencia nunca se valida. **Usar `discharge_pulse_hz=2`**
+(semiperiodo 250ms, 2.5x margen) en `rpi_digital_hil_config.json` -- ya viene
+configurado asi en el repo.
+
+```powershell
+$b1 = @{ signal="full_volts"; value=1 } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/output" -Method POST -Body $b1 -ContentType "application/json"
+
+$b2 = @{ signal="discharge_current_present"; value=1 } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/output" -Method POST -Body $b2 -ContentType "application/json"
+
+$b3 = @{ running=$true } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/pulse" -Method POST -Body $b3 -ContentType "application/json"
+```
+
+### 6. Esperar ~900ms, despues field_current_present
+
+**Punto de falla real #3:** activar `field_current_present` DEMASIADO PRONTO (mientras
+la FSM todavia esta en `ST_WAIT_DISCHARGE`) dispara `FAULT_DC_BEFORE_START` -- la
+proteccion de "corriente de campo antes de tiempo" cubre justo ese estado. Pero
+activarlo muy tarde tambien falla: `ST_VERIFY_FIELD` solo espera
+`field_current_on_timeout_ms=1500ms` antes de disparar `fault_code=5
+NO_FIELD_CURRENT`. Esperar ~900ms desde el paso anterior (tiempo de sobra para que la
+frecuencia de descarga se valide a 2 Hz y la FSM salga de `WAIT_DISCHARGE`) dio margen
+para las dos ventanas:
+
+```powershell
+Start-Sleep -Milliseconds 900
+$b4 = @{ signal="field_current_present"; value=1 } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/output" -Method POST -Body $b4 -ContentType "application/json"
+```
+
+La FSM entra sola a `RUNNING` (`fsm_state=7`) en cuanto `field_current_present` se
+sincroniza -- no hace falta ningun comando adicional para ese salto.
+
+### 7. motor_synchronized -- dentro de los 5s siguientes a RUNNING
+
+`ST_RUNNING` dispara `FAULT_PULL_OUT` si `motor_synchronized` no llega dentro de
+`pullout_timeout_ms=5000ms`. Con margen de sobra, activarlo apenas se confirma
+RUNNING:
+
+```powershell
+$b5 = @{ signal="motor_synchronized"; value=1 } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/output" -Method POST -Body $b5 -ContentType "application/json"
+```
+
+### 8. Confirmar RUNNING sostenido
+
+```powershell
+Invoke-WebRequest -Uri "http://192.168.1.50/status" -UseBasicParsing
+```
+
+Esperado: `fsm_state:7`, `fault_code:0`, `plant.relay_fax:true`, `plant.fault_out:false`,
+sostenido en varias consultas seguidas (no solo un instante).
+
+### Si algo falla en el medio
+
+1. `discharge_current_present` y demas salidas quedan asertadas -- primero
+   `SAFE_STOP` en la web del HIL (baja todo a reposo, condicion necesaria para que la
+   PZ permita RESET: `reset_safe` en el RTL exige `!field_current_sync &&
+   !discharge_sync`).
+2. **ACK y RESET fisico en el HMI de la PZ** (no por API -- ver la tabla de arriba).
+3. Confirmar `fault_active:false` y `fsm_state:1 (READY)` en `/status`.
+4. Volver al Paso 0 (los permisivos NO sobreviven si hubo power-cycle de por medio;
+   si solo fue ACK+RESET sin apagar la PZ, siguen aplicados) y reintentar desde el
+   Paso 3.
+
+### Nota sobre el touch de la PZ
+
+Durante esta misma sesion el panel tactil de la PZ dejo de responder dos veces, sin
+relacion aparente con los pasos de arriba (una vez coincidiendo con actividad
+electrica real del banco). La solucion que funciono las dos veces fue un
+**power-cycle completo de la PZ** (apagar/prender, no solo desconectar el cable USB
+del panel -- eso funciono la primera vez pero no la segunda). Si el touch no responde
+y hay que dar START/ACK/RESET, hacer el power-cycle, esperar a que arranque, y volver
+al Paso 0 de esta secuencia (los permisivos tampoco sobreviven un power-cycle).
+
 ## Secuencia de paro seguro
 
 1. En la interfaz web presionar `SAFE_STOP`.

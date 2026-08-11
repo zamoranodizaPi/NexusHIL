@@ -241,6 +241,34 @@ python3 /home/pi/NexusHIL/tools/rpi_digital_hil/nexus_sync_rpi_digital_hil.py --
         <li>Alguna salida esta conectada contra otra salida.</li>
       </ul>
     </section>
+    <section class="ok">
+      <h2>Despliegue en una Raspberry Pi remota (mismo usuario/password: <code>pi</code> / <code>pi</code>)</h2>
+      <p>Esta Raspberry (<code>192.168.1.120</code>) y una unidad remota con la misma estructura de sistema operativo pueden compartir el mismo repositorio. El repo vive en <a href="https://github.com/zamoranodizaPi/NexusHIL">https://github.com/zamoranodizaPi/NexusHIL</a> (rama <code>main</code>), publico, no requiere credencial para clonar/actualizar.</p>
+
+      <h3>Primera instalacion en la Raspberry remota</h3>
+      <pre># 1. Conectarse por SSH (mismo usuario y password que esta Raspberry: pi / pi)
+ssh pi@&lt;IP_RASPBERRY_REMOTA&gt;
+
+# 2. Clonar el repositorio
+git clone https://github.com/zamoranodizaPi/NexusHIL.git /home/pi/NexusHIL
+
+# 3. Instalar y arrancar el servicio systemd (queda activo al boot)
+bash /home/pi/NexusHIL/scripts/install_rpi_systemd_service.sh
+
+# 4. Verificar que quedo activo
+systemctl status nexus-hil-web.service --no-pager
+
+# 5. Abrir desde una computadora en la misma red que la Raspberry remota
+#    http://&lt;IP_RASPBERRY_REMOTA&gt;:8080</pre>
+
+      <h3>Actualizar una instalacion existente (traer cambios nuevos)</h3>
+      <pre>ssh pi@&lt;IP_RASPBERRY_REMOTA&gt; "cd /home/pi/NexusHIL && git pull origin main && sudo systemctl restart nexus-hil-web.service && systemctl is-active nexus-hil-web.service"</pre>
+
+      <h3>Opcional: acceso directo de escritorio (para arranque manual sin systemd)</h3>
+      <pre>bash /home/pi/NexusHIL/scripts/install_rpi_desktop_shortcut.sh</pre>
+
+      <p>Notas: el script de systemd corre el servicio como usuario <code>pi</code> (no root), necesita que ese usuario tenga acceso al grupo <code>gpio</code> (viene asi por defecto en Raspberry Pi OS). Si al conectar por SSH la primera vez pide confirmar la huella del host, aceptar (es la primera conexion a esa Raspberry en particular). El puerto queda fijo en <code>8080</code> salvo que se pase <code>NEXUS_HIL_WEB_PORT=&lt;otro puerto&gt;</code> antes de correr el script de instalacion.</p>
+    </section>
   </main>
   <footer>
     Nexus by SIEZA 2026. Todos los derechos reservados.

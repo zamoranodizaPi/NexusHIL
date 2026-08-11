@@ -370,3 +370,28 @@ Pendiente:
 - Equipo en reinicio para retomar la secuencia completa desde cero.
 - Pendiente siguiente: repetir Paso 1-8 de `docs/rpi_digital_hil_ponovo_running_procedure.md` de forma coordinada (una sola persona operando el HIL a la vez), prestando especial atencion a mantener `discharge_current_present=ON` sostenido durante toda la etapa de descarga.
 
+## RUNNING alcanzado (2026-08-11, misma sesion)
+
+Se llego a `fsm_state=7 (RUNNING)` sostenido (`relay_fax=true`, `fault_code=0`) en el
+banco `192.168.1.50`. La receta exacta, con comandos y los 3 puntos de falla reales
+encontrados en el camino (timeout de 3s de `disc_current_on_timeout_ms` que arranca
+con `full_volts`, debounce de 100ms del RTL vs frecuencia de pulso de descarga, y la
+ventana de `field_current_present` entre "antes de tiempo" y el timeout de 1.5s) quedo
+documentada en detalle en `docs/rpi_digital_hil_ponovo_running_procedure.md`, seccion
+"Secuencia exacta verificada en banco".
+
+Bug de persistencia de settings confirmado reproducible (no es un evento aislado): el
+fix de permisivos se aplica en vivo pero `/api/settings/save` devuelve
+`AXI_APPLY_FAILED` y nunca llega a `nexus_settings_store_save()` -- hay que reaplicarlo
+despues de cada power-cycle de la PZ. Pendiente de arreglo real en
+`nexus-sync-product` (fuera del alcance de este repo HIL).
+
+Touch de la PZ se cayo 2 veces en la sesion sin relacion aparente con la secuencia del
+HIL -- power-cycle completo de la PZ lo resolvio las dos veces (el replug de solo el
+cable USB funciono la primera vez, no la segunda).
+
+Este mismo procedimiento se va a replicar en una unidad remota (misma estructura de
+Raspberry Pi, mismo usuario/password `pi`/`pi`), operado por un tecnico en sitio. Ver
+la seccion de despliegue agregada al final de `docs/rpi_digital_hil_simulator.html`
+para los comandos de `git clone` + instalacion del servicio via SSH.
+
