@@ -10,6 +10,59 @@ Este procedimiento combina:
 
 La Raspberry no genera voltajes ni corrientes. La Ponovo entrega las senales analogicas hacia el acondicionamiento/ADS/PZ. No conectar salidas Ponovo directamente al ADC/ADS si no existe etapa de acondicionamiento, aislamiento y escalamiento validada.
 
+## Preparativos para un sitio remoto (Raspberry y PZ en redes distintas)
+
+Asumir por defecto que la Raspberry remota **no** va a tener acceso IP a la PZ remota
+-- son equipos independientes y solo estan unidos por el cableado GPIO fisico
+(`rpi_digital_hil_connection_map.md`), que no depende de ninguna red.
+
+**Cableado (siempre, no depende de red):** conectar Raspberry <-> PZ segun el mapa de
+conexion. Esto es lo unico estrictamente necesario para que la Secuencia Automatica
+Guiada de la web funcione, porque esa secuencia solo mira las señales GPIO
+(`motor_run`, `relay_56k`, `relay_fax`, `fault_out`) -- nunca llama a la API HTTP de
+la PZ.
+
+**Correccion de permisivos -- via consola serial (UART), sin red:**
+
+La PZ reinicia con `permissive_active_high_mask=0` (en vez de `255`) cada vez que se
+apaga y prende -- es un bug conocido de persistencia (ver `MEMORIA_NEXUS_HIL.md`).
+Confirmado por inspeccion directa del RTL (`fpga/rtl/sync_control_fsm.v:252`,
+`permissives_ok`) que `permissive_required_start_mask` y
+`permissive_required_run_mask` **no los usa ninguna logica real** -- son registros
+que se guardan y se leen de vuelta pero ningun bloque del FSM los consume. Por eso el
+fix completo (funcionalmente equivalente al de la API HTTP) se puede hacer solo con
+los otros 3 campos, por consola serial, sin ninguna dependencia de red:
+
+```
+param set 13 255
+param set 14 255
+param set 15 0
+param apply
+```
+
+(indice 13 = `permissive_enable_mask`, 14 = `permissive_active_high_mask`, 15 =
+`permissive_bypass_mask`). Estos comandos no piden login Sieza (a diferencia de
+`log verbose`, que si esta interceptado -- ver bug conocido mas abajo). Requiere
+acceso fisico por USB-serial a la PZ (mismo puerto/cable que se usa para diagnostico
+UART -- 115200 8N1). Repetir despues de cada reinicio de la PZ, igual que el fix por
+HTTP.
+
+**Si en algun momento SI hay red compartida** (por ejemplo, alguien conecta un cable
+de red temporal entre la PZ y la misma red que la Raspberry, o la Raspberry consigue
+una segunda interfaz), el fix por HTTP (Paso 0 mas abajo) sigue siendo valido y hace
+lo mismo.
+
+**Otros preparativos:**
+- Credenciales de la PZ: default `operator:SIE2` si nadie las cambio (solo aplica si
+  se termina usando la via HTTP).
+- Acceso fisico al HMI tactil de la PZ para START/ACK/RESET -- esto es local siempre,
+  ninguna red lo reemplaza.
+- Fuente analogica (Ponovo o equivalente) disponible y calibrada en el banco remoto.
+- Confirmar que el firmware de la PZ remota es el mismo build que el usado para
+  verificar todo esto (`NEXUS_SYNC_MEAS_V2B_RAW32_ZC_INTERP_HW_TEST` en este banco) --
+  si difiere, los indices `param` y los nombres/valores de fallas podrian no coincidir
+  exactamente.
+
 ## Coordinacion antes de operar el HIL remoto
 
 `SAFE_STOP`, `READY` y cualquier boton de senal en la web de la Raspberry cambian salidas fisicas reales hacia la PZ. `READY` en particular vuelve a poner en 0 `full_volts`, `field_current_present`, `discharge_current_present` y `motor_synchronized` -- si alguien esta en medio de una secuencia manual en el banco (por ejemplo en la etapa de descarga con `discharge_current_present=ON`), una llamada remota a `READY`/`SAFE_STOP` le resetea esas senales sin aviso y puede contribuir a una falla real (ya paso: una prueba remota de `ARM`+`READY` coincidio con una prueba manual en curso y la PZ cayo en `DISCHARGE_CIRCUIT`).
@@ -302,6 +355,14 @@ documento: nunca tocar la web del HIL mientras la persona en el banco esta en me
 una secuencia manual.
 
 ### 0. Corregir permisivos (repetir despues de CADA reinicio de la PZ)
+
+**Si la Raspberry NO tiene red hacia la PZ (sitio remoto tipico -- ver "Preparativos
+para un sitio remoto" al inicio de este documento), usar la via por UART en vez de
+curl: `param set 13 255`, `param set 14 255`, `param set 15 0`, `param apply`. Es
+funcionalmente equivalente (confirmado por RTL: los 2 campos que esa via no toca no
+los usa ninguna logica real) y no depende de ninguna red.**
+
+Con red disponible:
 
 ```powershell
 curl.exe -u operator:SIE2 -H "Content-Type: application/json" -X POST --data-raw "{\"permissive_enable_mask\":255,\"permissive_required_start_mask\":131,\"permissive_required_run_mask\":229,\"permissive_active_high_mask\":255,\"permissive_bypass_mask\":0}" http://192.168.1.50/api/settings/save
