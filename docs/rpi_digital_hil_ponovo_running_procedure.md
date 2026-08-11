@@ -12,26 +12,30 @@ La Raspberry no genera voltajes ni corrientes. La Ponovo entrega las senales ana
 
 ## Preparativos para un sitio remoto (Raspberry y PZ en redes distintas)
 
-Asumir por defecto que la Raspberry remota **no** va a tener acceso IP a la PZ remota
--- son equipos independientes y solo estan unidos por el cableado GPIO fisico
-(`rpi_digital_hil_connection_map.md`), que no depende de ninguna red.
+La Raspberry remota y la PZ remota **no** comparten red entre si -- son equipos
+independientes, unidos solo por el cableado GPIO fisico
+(`rpi_digital_hil_connection_map.md`), que no depende de ninguna red. Eso no es un
+problema para nada de lo de abajo, porque cada pieza necesita una red distinta:
 
-**Cableado (siempre, no depende de red):** conectar Raspberry <-> PZ segun el mapa de
-conexion. Esto es lo unico estrictamente necesario para que la Secuencia Automatica
-Guiada de la web funcione, porque esa secuencia solo mira las señales GPIO
-(`motor_run`, `relay_56k`, `relay_fax`, `fault_out`) -- nunca llama a la API HTTP de
-la PZ.
+- **La Secuencia Automatica Guiada de la web de la Raspberry** solo mira senales GPIO
+  (`motor_run`, `relay_56k`, `relay_fax`, `fault_out`) -- nunca llama a la API HTTP de
+  la PZ. Le alcanza con el cableado fisico, sin importar en que red este la Raspberry.
+- **La correccion de permisivos** se hace por HTTP contra la web de la PZ (ver Paso 0
+  mas abajo) -- confirmado que **si hay acceso web a la PZ** (por la red que sea,
+  no tiene que ser la misma de la Raspberry; lo puede correr cualquier dispositivo que
+  llegue a esa IP, por ejemplo la notebook del tecnico). Con eso alcanza, es la via ya
+  probada hoy de punta a punta.
 
-**Correccion de permisivos -- via consola serial (UART), sin red:**
+**Cableado (siempre):** conectar Raspberry <-> PZ segun el mapa de conexion antes de
+usar la Secuencia Automatica Guiada.
 
-La PZ reinicia con `permissive_active_high_mask=0` (en vez de `255`) cada vez que se
-apaga y prende -- es un bug conocido de persistencia (ver `MEMORIA_NEXUS_HIL.md`).
-Confirmado por inspeccion directa del RTL (`fpga/rtl/sync_control_fsm.v:252`,
-`permissives_ok`) que `permissive_required_start_mask` y
-`permissive_required_run_mask` **no los usa ninguna logica real** -- son registros
-que se guardan y se leen de vuelta pero ningun bloque del FSM los consume. Por eso el
-fix completo (funcionalmente equivalente al de la API HTTP) se puede hacer solo con
-los otros 3 campos, por consola serial, sin ninguna dependencia de red:
+**Alternativa por consola serial (UART), solo si en algun momento se pierde el acceso
+web a la PZ:** confirmado por inspeccion directa del RTL
+(`fpga/rtl/sync_control_fsm.v:252`, `permissives_ok`) que
+`permissive_required_start_mask` y `permissive_required_run_mask` **no los usa
+ninguna logica real** -- son registros que se guardan y se leen de vuelta pero ningun
+bloque del FSM los consume. Por eso, si hiciera falta, el mismo fix se puede hacer sin
+red por consola serial con los otros 3 campos:
 
 ```
 param set 13 255
@@ -41,27 +45,17 @@ param apply
 ```
 
 (indice 13 = `permissive_enable_mask`, 14 = `permissive_active_high_mask`, 15 =
-`permissive_bypass_mask`). Estos comandos no piden login Sieza (a diferencia de
-`log verbose`, que si esta interceptado -- ver bug conocido mas abajo). Requiere
-acceso fisico por USB-serial a la PZ (mismo puerto/cable que se usa para diagnostico
-UART -- 115200 8N1). Repetir despues de cada reinicio de la PZ, igual que el fix por
-HTTP.
-
-**Si en algun momento SI hay red compartida** (por ejemplo, alguien conecta un cable
-de red temporal entre la PZ y la misma red que la Raspberry, o la Raspberry consigue
-una segunda interfaz), el fix por HTTP (Paso 0 mas abajo) sigue siendo valido y hace
-lo mismo.
+`permissive_bypass_mask`). No requiere login Sieza. Queda documentado como respaldo,
+no hace falta usarlo si el acceso web a la PZ esta confirmado.
 
 **Otros preparativos:**
-- Credenciales de la PZ: default `operator:SIE2` si nadie las cambio (solo aplica si
-  se termina usando la via HTTP).
+- Credenciales de la PZ: default `operator:SIE2` si nadie las cambio.
 - Acceso fisico al HMI tactil de la PZ para START/ACK/RESET -- esto es local siempre,
   ninguna red lo reemplaza.
 - Fuente analogica (Ponovo o equivalente) disponible y calibrada en el banco remoto.
 - Confirmar que el firmware de la PZ remota es el mismo build que el usado para
   verificar todo esto (`NEXUS_SYNC_MEAS_V2B_RAW32_ZC_INTERP_HW_TEST` en este banco) --
-  si difiere, los indices `param` y los nombres/valores de fallas podrian no coincidir
-  exactamente.
+  si difiere, los valores/nombres de fallas podrian no coincidir exactamente.
 
 ## Coordinacion antes de operar el HIL remoto
 
@@ -362,11 +356,36 @@ curl: `param set 13 255`, `param set 14 255`, `param set 15 0`, `param apply`. E
 funcionalmente equivalente (confirmado por RTL: los 2 campos que esa via no toca no
 los usa ninguna logica real) y no depende de ninguna red.**
 
-Con red disponible:
+Con red disponible, hay dos formas equivalentes de aplicar el mismo fix -- por curl,
+o directo en la propia pantalla de Ajustes de la web de la PZ (sirve tambien para
+verificar visualmente, ya que ahi se ve el mismo error `AXI_APPLY_FAILED` que reporta
+la API):
 
 ```powershell
 curl.exe -u operator:SIE2 -H "Content-Type: application/json" -X POST --data-raw "{\"permissive_enable_mask\":255,\"permissive_required_start_mask\":131,\"permissive_required_run_mask\":229,\"permissive_active_high_mask\":255,\"permissive_bypass_mask\":0}" http://192.168.1.50/api/settings/save
 ```
+
+**Por la web de la PZ:** menu lateral `CONFIGURACION -> Ajustes`. Arriba de la
+pantalla estan los botones `Apply` / `Save` / `Reset` / `Export` -- el mismo error
+`AXI_APPLY_FAILED` que reporta el curl aparece ahi tambien en rojo (confirma que no
+es un problema de la llamada HTTP en si, es el mismo bug de fondo visible desde
+cualquier lado):
+
+![Pantalla de Ajustes de la PZ -- botones Apply/Save/Reset/Export y el error AXI_APPLY_FAILED](images/pz_web_ajustes_apply_save.png)
+
+Bajando en esa misma pantalla esta la seccion `PERMISSIVES - TESTING BYPASS`, con
+checkboxes de bypass por senal (Thermal OK, Exciter Ready, Full Volts, Plant Fault):
+
+![Seccion PERMISSIVES - TESTING BYPASS de Ajustes, con los 4 checkboxes de bypass](images/pz_web_ajustes_permissives_bypass.png)
+
+**Atajo mas simple para banco/HIL (NO usar en operacion real, la propia pantalla lo
+advierte):** tildar `Bypass Plant Fault` fuerza `plant_fault_eff=0` en el RTL sin
+importar el problema de polaridad de `permissive_active_high_mask` --
+`plant_fault_eff = (!permissive_enable_mask[7] || permissive_bypass_mask[7]) ? 1'b0 : plant_fault_f`
+(`pz_sync_control_axi_top.v:1177`). Evita todo el fix de permisivos para las pruebas
+de este HIL, a costa de dejar esa proteccion real deshabilitada mientras el bypass
+siga tildado -- por eso la advertencia en pantalla. Usar el fix de permisivos completo
+(arriba) para cualquier prueba que deba parecerse a la operacion real.
 
 **Bug conocido, sin arreglar todavia:** esta llamada casi siempre responde
 `{"ok":false,"error":"AXI_APPLY_FAILED"}` (HTTP 500) -- ignorar ese error, el valor SI
