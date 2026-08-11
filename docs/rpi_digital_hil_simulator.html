@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus Sync - Simulador HIL Web con Raspberry Pi</title>
+  <style>
+    :root {
+      --sieza-green: #9ed51d;
+      --sieza-green-dark: #3f7f16;
+      --sieza-charcoal: #2f3437;
+      --sieza-ink: #202124;
+      --sieza-line: #d9dee3;
+      --sieza-soft: #f4f8ee;
+    }
+    body { margin: 0; font-family: Arial, sans-serif; line-height: 1.45; color: var(--sieza-ink); background: #f7f8fa; }
+    header { background: linear-gradient(90deg, var(--sieza-charcoal), #1f2a1f); color: #fff; padding: 22px 32px; border-bottom: 6px solid var(--sieza-green); }
+    .brand { display: flex; align-items: center; gap: 18px; max-width: 1180px; margin: 0 auto; }
+    .brand img { width: 92px; height: 92px; object-fit: contain; background: #fff; border-radius: 6px; padding: 6px; }
+    .brand-copy { min-width: 0; }
+    main { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; }
+    section { background: #fff; border: 1px solid #d9dee3; border-radius: 6px; padding: 18px; margin: 16px 0; }
+    h1, h2 { margin: 0 0 12px; }
+    h2 { color: var(--sieza-green-dark); border-bottom: 2px solid var(--sieza-soft); padding-bottom: 6px; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 14px; }
+    th, td { border: 1px solid #d9dee3; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: var(--sieza-soft); color: var(--sieza-charcoal); }
+    code, pre { background: #eef2f4; border-radius: 4px; }
+    code { padding: 2px 4px; }
+    pre { padding: 12px; overflow-x: auto; }
+    .warn { border-left: 5px solid #b3261e; }
+    .ok { border-left: 5px solid var(--sieza-green-dark); }
+    footer { max-width: 1180px; margin: 0 auto; padding: 18px 20px 32px; color: #4b5563; font-size: 13px; border-top: 1px solid var(--sieza-line); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <img src="../assets/branding/sieza_logo_light.png" alt="SIEZA">
+      <div class="brand-copy">
+        <h1>Nexus Sync - Simulador HIL Web con Raspberry Pi</h1>
+        <p>Herramienta web de banco para simular estados digitales de planta y monitorear salidas digitales de la PZ.</p>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section>
+      <h2>Proposito</h2>
+      <p>La Raspberry Pi solo simula estados digitales. No genera DAC, voltajes de motor, corrientes de motor, corriente de campo ni senales analogicas para el ADS. Los voltajes y corrientes deben inyectarse externamente al ADS/PZ.</p>
+    </section>
+
+    <section>
+      <h2>Arquitectura</h2>
+      <pre>Raspberry Pi GPIO
+  -> estados digitales hacia PZ JM2
+
+PZ JM1/JM2
+  -> salidas digitales hacia Raspberry Pi
+
+Fuente externa / generador
+  -> voltajes y corrientes hacia ADS/PZ</pre>
+    </section>
+
+    <section class="warn">
+      <h2>Advertencias electricas</h2>
+      <ul>
+        <li>Usar 3.3 V unicamente.</li>
+        <li>Conectar GND comun primero.</li>
+        <li>No conectar 5 V a GPIO Raspberry ni a pines PZ.</li>
+        <li>No unir salida contra salida.</li>
+        <li>Usar resistencia serie de 220 ohm a 1 kohm en cada GPIO.</li>
+        <li>Usar optoacopladores si hay ruido, cables largos o hardware de potencia externo.</li>
+        <li>No conectar motor, SCR de potencia ni campo durante la primera prueba digital.</li>
+        <li>Las senales SCR gate son logica de prueba, no disparo directo de potencia.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Raspberry -> PZ</h2>
+      <table>
+        <tr><th>Funcion</th><th>Senal Raspberry</th><th>GPIO BCM</th><th>Pin Raspberry</th><th>Senal PZ</th><th>Pin PZ</th><th>Package</th><th>Inicial</th></tr>
+        <tr><td>Termico OK</td><td>RPI_THERMAL_OK_OUT</td><td>5</td><td>29</td><td><code>thermal_ok_in</code></td><td>JM2-11</td><td>G15</td><td>1</td></tr>
+        <tr><td>Excitador listo</td><td>RPI_EXCITER_READY_OUT</td><td>6</td><td>31</td><td><code>exciter_ready</code></td><td>JM2-13</td><td>K16</td><td>1</td></tr>
+        <tr><td>Falla de planta</td><td>RPI_PLANT_FAULT_OUT</td><td>13</td><td>33</td><td><code>plant_fault</code></td><td>JM2-19</td><td>N16</td><td>0</td></tr>
+        <tr><td>Voltaje pleno</td><td>RPI_FULL_VOLTS_OUT</td><td>7</td><td>26</td><td><code>full_volts</code></td><td>JM2-9</td><td>H15</td><td>0</td></tr>
+        <tr><td>Corriente campo</td><td>RPI_FIELD_CURRENT_PRESENT_OUT</td><td>26</td><td>37</td><td><code>field_current_present</code></td><td>JM2-15</td><td>J16</td><td>0</td></tr>
+        <tr><td>Motor sincronizado</td><td>RPI_MOTOR_SYNCHRONIZED_OUT</td><td>16</td><td>36</td><td><code>motor_synchronized</code></td><td>JM2-17</td><td>N15</td><td>0</td></tr>
+        <tr><td>Corriente descarga</td><td>RPI_DISCHARGE_CURRENT_PRESENT_OUT</td><td>20</td><td>38</td><td><code>discharge_current_present</code></td><td>JM2-5</td><td>G19</td><td>0</td></tr>
+        <tr><td>Pulso descarga</td><td>RPI_DISCHARGE_EXTINCTION_PULSE_OUT</td><td>21</td><td>40</td><td><code>discharge_extinction_pulse</code></td><td>JM2-7</td><td>G20</td><td>0</td></tr>
+      </table>
+      <p>Si la API de la PZ muestra <code>fault_code=0</code>, <code>fault_name=NONE</code>, medicion ADS valida y aun asi queda en <code>fsm_state=INIT</code>, revisar las mascaras de permisivos en <code>/api/settings</code>. Para este HIL deben quedar: <code>permissive_enable_mask=255</code>, <code>permissive_required_start_mask=131</code>, <code>permissive_required_run_mask=229</code>, <code>permissive_active_high_mask=255</code> y <code>permissive_bypass_mask=0</code>. Si <code>settings_status=STORED_CLAMPED</code> o <code>permissive_active_high_mask=0</code>, la PZ puede interpretar los permisivos invertidos.</p>
+      <pre>curl.exe -u operator:SIE2 -H "Content-Type: application/json" -X POST --data-raw "{\"permissive_enable_mask\":255,\"permissive_required_start_mask\":131,\"permissive_required_run_mask\":229,\"permissive_active_high_mask\":255,\"permissive_bypass_mask\":0}" http://192.168.1.50/api/settings/save</pre>
+      <p>Si la PZ responde ping pero el puerto HTTP 80 queda cerrado despues de un intento de API, esperar 30 s. Si no regresa, hacer power-cycle de la PZ o usar consola UART.</p>
+    </section>
+
+    <section>
+      <h2>PZ -> Raspberry</h2>
+      <table>
+        <tr><th>Funcion</th><th>Senal PZ</th><th>Pin PZ</th><th>Package</th><th>Senal Raspberry</th><th>GPIO BCM</th><th>Pin Raspberry</th><th>Activo</th></tr>
+        <tr><td>Arranque/run</td><td><code>motor_run</code></td><td>JM1-15</td><td>G18</td><td>PZ_MOTOR_RUN_IN</td><td>17</td><td>11</td><td>HIGH</td></tr>
+        <tr><td>56K listo</td><td><code>relay_56k</code></td><td>JM1-16</td><td>A20</td><td>PZ_RELAY_56K_IN</td><td>27</td><td>13</td><td>HIGH</td></tr>
+        <tr><td>Campo habilitado</td><td><code>field_enable</code></td><td>JM1-17</td><td>D19</td><td>PZ_FIELD_ENABLE_IN</td><td>22</td><td>15</td><td>HIGH</td></tr>
+        <tr><td>FAX running</td><td><code>relay_fax</code></td><td>JM1-18</td><td>C20</td><td>PZ_RELAY_FAX_IN</td><td>23</td><td>16</td><td>HIGH</td></tr>
+        <tr><td>Falla/trip</td><td><code>fault_out</code></td><td>JM1-23</td><td>H18</td><td>PZ_FAULT_OUT_IN</td><td>24</td><td>18</td><td>HIGH</td></tr>
+        <tr><td>SCR enable</td><td><code>scr_enable</code></td><td>JM1-25</td><td>K17</td><td>PZ_SCR_ENABLE_IN</td><td>25</td><td>22</td><td>HIGH</td></tr>
+        <tr><td>FWT</td><td><code>fwt_cmd</code></td><td>JM1-27</td><td>K18</td><td>PZ_FWT_CMD_IN</td><td>12</td><td>32</td><td>HIGH</td></tr>
+        <tr><td>DST</td><td><code>dst_cmd</code></td><td>JM1-29</td><td>L16</td><td>PZ_DST_CMD_IN</td><td>18</td><td>12</td><td>HIGH</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Monitoreo opcional</h2>
+      <p>Estos pines son opcionales y quedan deshabilitados durante la prueba principal para evitar confundir estados de PZ con pulsos SCR.</p>
+      <table>
+        <tr><th>Senal PZ</th><th>Pin PZ</th><th>Package</th><th>GPIO BCM</th><th>Pin Raspberry</th><th>Nota</th></tr>
+        <tr><td><code>field_pwm</code></td><td>JM1-19</td><td>D20</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>sync_pulse</code></td><td>JM1-21</td><td>J18</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>scr_gate_g1</code></td><td>JM2-21</td><td>T16</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>scr_gate_g2</code></td><td>JM2-23</td><td>U17</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>scr_gate_g3</code></td><td>JM2-25</td><td>P14</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>scr_gate_g4</code></td><td>JM2-27</td><td>R14</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>scr_gate_g5</code></td><td>JM2-29</td><td>T11</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+        <tr><td><code>scr_gate_g6</code></td><td>JM2-31</td><td>T10</td><td>null</td><td>-</td><td>Monitoreo opcional</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Estado READY</h2>
+      <p>READY real en Nexus Sync requiere medicion analogica valida desde ADS/Ponovo. La Raspberry solo aporta los permisivos digitales.</p>
+      <pre>measurement_online = signal_present && freq_valid && freq_ok
+thermal_ok_in = 1
+exciter_ready = 1
+plant_fault = 0
+fault_latched = 0</pre>
+      <p>Si los permisivos digitales estan correctos pero <code>relay_56k</code> sigue en 0, revisar primero voltajes/frecuencia ADS, fault latched y configuracion de medicion. No usar <code>full_volts</code> para entrar a READY; <code>full_volts</code> se activa despues de START.</p>
+    </section>
+
+    <section>
+      <h2>Reposo Digital</h2>
+      <pre>thermal_ok_in = 1
+exciter_ready = 1
+plant_fault = 0
+full_volts = 0
+field_current_present = 0
+motor_synchronized = 0
+discharge_current_present = 0
+discharge_extinction_pulse = 0</pre>
+    </section>
+
+    <section>
+      <h2>Procedimiento</h2>
+      <ol>
+        <li>Apagar PZ y Raspberry Pi.</li>
+        <li>Conectar GND comun.</li>
+        <li>Cablear Raspberry -> PZ.</li>
+        <li>Cablear PZ -> Raspberry.</li>
+        <li>Inyectar externamente voltajes/corrientes al ADS.</li>
+        <li>Encender Raspberry Pi.</li>
+        <li>Abrir el acceso directo del escritorio para levantar el servicio web.</li>
+        <li>Desde la computadora abrir <code>http://192.168.1.120:8080</code>.</li>
+        <li>Confirmar las advertencias de seguridad.</li>
+        <li>Presionar <code>ARMAR</code> y despues <code>READY</code> para aplicar reposo digital: <code>thermal_ok_in=1</code>, <code>exciter_ready=1</code>, <code>plant_fault=0</code>.</li>
+        <li>Encender Ponovo V1/V2/V3 a 60 Hz, balanceados, con corrientes en 0 A.</li>
+        <li>Esperar que la PZ/HMI muestre voltaje y frecuencia validos.</li>
+        <li>Confirmar en la web que <code>relay_56k=1</code>; eso indica READY real.</li>
+        <li>Solo despues de <code>relay_56k=1</code>, dar START desde HMI/API.</li>
+        <li>Solo despues de ver <code>motor_run=1</code>, activar <code>full_volts</code>.</li>
+        <li>Usar SAFE_STOP al finalizar.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>Procedimiento con Ponovo para RUNNING</h2>
+      <p>La Ponovo debe inyectar las senales analogicas hacia el acondicionamiento/ADS/PZ. La Raspberry solo entrega los estados digitales.</p>
+      <table>
+        <tr><th>ADS/PZ</th><th>Nombre</th><th>Ponovo sugerido</th><th>Uso</th></tr>
+        <tr><td>CH0</td><td>Vab</td><td>V1</td><td>Voltaje, frecuencia, PLL/ZC</td></tr>
+        <tr><td>CH1</td><td>Vbc</td><td>V2</td><td>Voltaje, secuencia</td></tr>
+        <tr><td>CH2</td><td>Vca</td><td>V3</td><td>Voltaje, secuencia</td></tr>
+        <tr><td>CH3</td><td>Ia</td><td>I1</td><td>Corriente fase A</td></tr>
+        <tr><td>CH4</td><td>Ib</td><td>I2</td><td>Corriente fase B</td></tr>
+        <tr><td>CH5</td><td>Ic</td><td>I3</td><td>Corriente fase C</td></tr>
+        <tr><td>CH6</td><td>FieldCurrent</td><td>Aux/I4</td><td>Corriente de campo</td></tr>
+        <tr><td>CH7</td><td>DischargeCurrent</td><td>Aux/I5</td><td>Corriente de descarga</td></tr>
+      </table>
+      <p>Secuencia corta corregida: encender Vab/Vbc/Vca balanceados a 60 Hz, confirmar medicion valida en PZ/HMI, aplicar <code>ARMAR</code> y <code>READY</code> en la web, esperar <code>relay_56k=1</code>, dar START en PZ, esperar <code>motor_run=1</code>, activar <code>full_volts</code>, activar <code>discharge_current_present</code> y el tren <code>discharge_extinction_pulse</code>, esperar <code>field_enable</code>, activar <code>field_current_present</code>, confirmar sincronismo analogico y activar <code>motor_synchronized</code>. El detalle completo esta en <code>docs/rpi_digital_hil_ponovo_running_procedure.md</code>.</p>
+    </section>
+
+    <section class="warn">
+      <h2>Si No Entra READY</h2>
+      <table>
+        <tr><th>Punto</th><th>Esperado</th><th>Accion</th></tr>
+        <tr><td><code>thermal_ok_in</code></td><td>1</td><td>Revisar GPIO5/pin 29 hacia JM2-11/G15.</td></tr>
+        <tr><td><code>exciter_ready</code></td><td>1</td><td>Revisar GPIO6/pin 31 hacia JM2-13/K16.</td></tr>
+        <tr><td><code>plant_fault</code></td><td>0</td><td>Dejar OFF; revisar GPIO13/pin 33 hacia JM2-19/N16.</td></tr>
+        <tr><td><code>full_volts</code></td><td>0</td><td>Debe estar OFF antes de START; ahora usa GPIO7/pin 26 hacia JM2-9/H15.</td></tr>
+        <tr><td><code>fault_out</code></td><td>0</td><td>Si esta 1, hacer reset/ack fault desde HMI/API y revisar codigo de falla.</td></tr>
+        <tr><td><code>relay_56k</code></td><td>1</td><td>Si queda 0, READY no esta declarado por la PZ.</td></tr>
+        <tr><td>Ponovo V1/V2/V3</td><td>ON</td><td>Sin voltaje ADS valido no hay <code>measurement_online</code>.</td></tr>
+        <tr><td>Frecuencia</td><td>60 Hz estable</td><td>Revisar tolerancia/configuracion de frecuencia si el proyecto usa otro nominal.</td></tr>
+        <tr><td>Secuencia</td><td>positiva</td><td>V1/V2/V3 deben corresponder a Vab/Vbc/Vca con angulos 0, -120, +120.</td></tr>
+      </table>
+    </section>
+
+    <section>
+      <h2>Comandos</h2>
+      <pre>/home/pi/NexusHIL/scripts/run_rpi_digital_hil_web.sh
+
+python3 /home/pi/NexusHIL/tools/rpi_digital_hil/nexus_sync_rpi_digital_hil_web.py --config /home/pi/NexusHIL/rpi_digital_hil_config.json --host 0.0.0.0 --port 8080
+
+python3 /home/pi/NexusHIL/tools/rpi_digital_hil/nexus_sync_rpi_digital_hil.py --config /home/pi/NexusHIL/rpi_digital_hil_config.json --mode manual
+
+python3 /home/pi/NexusHIL/tools/rpi_digital_hil/nexus_sync_rpi_digital_hil.py --config /home/pi/NexusHIL/rpi_digital_hil_config.json --mode auto
+
+python3 /home/pi/NexusHIL/tools/rpi_digital_hil/nexus_sync_rpi_digital_hil.py --config /home/pi/NexusHIL/rpi_digital_hil_config.json --mode monitor</pre>
+      <p>La interfaz web se abre desde la computadora en <code>http://192.168.1.120:8080</code>. Incluye ARMAR, READY, SAFE_STOP, botones para salidas, indicadores de entradas y tren <code>discharge_extinction_pulse PULSE ON/OFF</code>. La frecuencia inicial se configura en <code>timing_ms.discharge_pulse_hz</code> dentro de <code>rpi_digital_hil_config.json</code>.</p>
+    </section>
+
+    <section class="ok">
+      <h2>Criterios PASS</h2>
+      <ul>
+        <li>PZ detecta <code>thermal_ok_in=1</code>, <code>exciter_ready=1</code> y <code>plant_fault=0</code>.</li>
+        <li>Raspberry detecta <code>motor_run=1</code> cuando PZ ordena arranque.</li>
+        <li>Raspberry activa <code>full_volts=1</code> solo despues de confirmar la inyeccion analogica externa.</li>
+        <li>Raspberry detecta <code>field_enable=1</code>.</li>
+        <li>Raspberry activa <code>field_current_present=1</code>.</li>
+        <li>Raspberry activa <code>motor_synchronized=1</code> solo con confirmacion manual.</li>
+        <li>PZ llega a RUNNING o al estado esperado.</li>
+        <li>SAFE_STOP limpia salidas no seguras.</li>
+      </ul>
+    </section>
+
+    <section class="warn">
+      <h2>Criterios FAIL</h2>
+      <ul>
+        <li>PZ no detecta <code>thermal_ok_in</code> o <code>exciter_ready</code>.</li>
+        <li>PZ detecta <code>plant_fault</code> inesperado.</li>
+        <li>Raspberry no detecta <code>motor_run</code>.</li>
+        <li><code>fault_out</code> se activa inesperadamente.</li>
+        <li>Alguna senal usa 5 V.</li>
+        <li>Alguna salida esta conectada contra otra salida.</li>
+      </ul>
+    </section>
+  </main>
+  <footer>
+    Nexus by SIEZA 2026. Todos los derechos reservados.
+  </footer>
+</body>
+</html>

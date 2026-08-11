@@ -1,0 +1,40 @@
+{
+  "gpio_mode": "BCM",
+  "outputs_to_pz": {
+    "thermal_ok_in": 5,
+    "exciter_ready": 6,
+    "plant_fault": 13,
+    "full_volts": 7,
+    "field_current_present": 26,
+    "motor_synchronized": 16,
+    "discharge_current_present": 20,
+    "discharge_extinction_pulse": 21
+  },
+  "inputs_from_pz": {
+    "motor_run": 17,
+    "relay_56k": 27,
+    "field_enable": 22,
+    "relay_fax": 23,
+    "fault_out": 24,
+    "scr_enable": 25,
+    "fwt_cmd": 12,
+    "dst_cmd": 18
+  },
+  "optional_inputs_from_pz": {
+    "field_pwm": null,
+    "sync_pulse": null,
+    "scr_gate_g1": null,
+    "scr_gate_g2": null,
+    "scr_gate_g3": null,
+    "scr_gate_g4": null,
+    "scr_gate_g5": null,
+    "scr_gate_g6": null
+  },
+  "timing_ms": {
+    "status_refresh": 500,
+    "full_volts_delay": 1000,
+    "field_present_delay": 1000,
+    "sync_delay": 1000,
+    "discharge_pulse_hz": 5
+  }
+}
