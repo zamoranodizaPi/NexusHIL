@@ -35,6 +35,6 @@
     "full_volts_delay": 1000,
     "field_present_delay": 1000,
     "sync_delay": 1000,
-    "discharge_pulse_hz": 5
+    "discharge_pulse_hz": 1
   }
 }
