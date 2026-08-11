@@ -51,6 +51,11 @@ class HilWebApp:
         self.pulse_level = 0
         self.pulse_thread: threading.Thread | None = None
         self.last_message = "Servicio web iniciado en estado seguro"
+        self.auto_active = False
+        self.auto_cancel = False
+        self.auto_step = "idle"
+        self.auto_message = "Secuencia automatica no iniciada"
+        self.auto_thread: threading.Thread | None = None
 
     def output_value(self, name: str) -> int:
         return self.hil.gpio.input(self.hil.pin_out(name))
@@ -70,6 +75,11 @@ class HilWebApp:
                 "pulse": {
                     "running": self.pulse_running,
                     "hz": self.hil.config.timing_ms.get("discharge_pulse_hz", 5),
+                },
+                "auto": {
+                    "active": self.auto_active,
+                    "step": self.auto_step,
+                    "message": self.auto_message,
                 },
             }
 
@@ -110,10 +120,14 @@ class HilWebApp:
 
     def safe_stop(self) -> Dict[str, Any]:
         with self.lock:
+            self.auto_cancel = True
             self.stop_pulse_locked()
             self.hil.safe_stop()
             self.armed = False
             self.last_message = "SAFE_STOP aplicado; sistema desarmado"
+            if self.auto_active:
+                self.auto_step = "idle"
+                self.auto_message = "Detenido manualmente (SAFE_STOP)."
             return {"ok": True, "message": self.last_message}
 
     def toggle_pulse(self, run: bool) -> Dict[str, Any]:
@@ -147,6 +161,183 @@ class HilWebApp:
                 self.pulse_level = 0 if self.pulse_level else 1
                 self.hil.write("discharge_extinction_pulse", self.pulse_level)
             time.sleep(half_period)
+
+    # ------------------------------------------------------------------
+    # Guided automatic sequence -- runs entirely on this Raspberry Pi (no
+    # network round-trip in the timing-critical path). Polls the PZ's own
+    # GPIO feedback signals (motor_run, fault_out, relay_56k, relay_fax --
+    # already wired, no dependency on the PZ's own flaky embedded HTTP
+    # server) and fires the timed output chain the instant motor_run goes
+    # high. Timing constants below match the RTL windows confirmed on
+    # bench 2026-08-11 (see docs/rpi_digital_hil_ponovo_running_procedure.md,
+    # "Secuencia exacta verificada en banco"):
+    #   - full_volts must land within incomplete_sequence_timeout_ms=12s of
+    #     motor_run going high (ST_START_DETECTED) -- fired immediately here.
+    #   - discharge_current_present + the pulse train must land within
+    #     disc_current_on_timeout_ms=3s of full_volts (not settings-exposed).
+    #   - field_current_present must land after leaving WAIT_DISCHARGE
+    #     (asserting it earlier trips FAULT_DC_BEFORE_START) but within
+    #     field_current_on_timeout_ms of entering VERIFY_FIELD -- the 900ms
+    #     dwell below is comfortably inside both windows at the pulse rate
+    #     configured in rpi_digital_hil_config.json (2 Hz by default).
+    #   - motor_synchronized must land within pullout_timeout_ms=5s of
+    #     reaching RUNNING.
+    def _auto_set(self, step: str, message: str) -> None:
+        with self.lock:
+            self.auto_step = step
+            self.auto_message = message
+
+    def _auto_wait_for(self, name: str, value: int, timeout_s: float, poll_s: float = 0.1) -> str:
+        """Returns 'ok', 'timeout', 'cancel', or 'fault'."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            with self.lock:
+                if self.auto_cancel:
+                    return "cancel"
+                if self.hil.read("fault_out"):
+                    return "fault"
+                if self.hil.read(name) == value:
+                    return "ok"
+            time.sleep(poll_s)
+        return "timeout"
+
+    def _auto_hold(self, seconds: float) -> str:
+        """Sleeps while watching for cancel/fault_out. Returns 'ok', 'cancel', or 'fault'."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            with self.lock:
+                if self.auto_cancel:
+                    return "cancel"
+                if self.hil.read("fault_out"):
+                    return "fault"
+            time.sleep(0.02)
+        return "ok"
+
+    def _auto_abort(self, message: str) -> None:
+        with self.lock:
+            self.stop_pulse_locked()
+            self.hil.safe_stop()
+            self.auto_step = "failed"
+            self.auto_message = message + " Salidas bajadas a reposo (SAFE_STOP aplicado)."
+            self.last_message = self.auto_message
+
+    def auto_start(self) -> Dict[str, Any]:
+        with self.lock:
+            if not self.armed:
+                return {"ok": False, "message": "Primero confirma seguridad y arma el sistema"}
+            if self.auto_active:
+                return {"ok": False, "message": "La secuencia automatica ya esta en curso"}
+            self.auto_active = True
+            self.auto_cancel = False
+            self._auto_set("starting", "Secuencia automatica iniciada.")
+            self.auto_thread = threading.Thread(target=self._auto_run, daemon=True)
+            self.auto_thread.start()
+            return {"ok": True, "message": "Secuencia automatica iniciada"}
+
+    def auto_cancel_request(self) -> Dict[str, Any]:
+        with self.lock:
+            if not self.auto_active:
+                return {"ok": True, "message": "No hay secuencia automatica en curso"}
+            self.auto_cancel = True
+            return {"ok": True, "message": "Cancelacion solicitada"}
+
+    def _auto_run(self) -> None:
+        try:
+            self._auto_set("ready", "Aplicando reposo digital (thermal_ok_in, exciter_ready)...")
+            with self.lock:
+                self.stop_pulse_locked()
+                self.hil.write("thermal_ok_in", 1)
+                self.hil.write("exciter_ready", 1)
+                self.hil.safe_stop()  # zeros full_volts/discharge/field/sync, keeps thermal/exciter untouched
+
+            self._auto_set(
+                "wait_relay56k",
+                "Esperando relay_56k=1 (READY real de la PZ -- confirma que Ponovo ya inyecta "
+                "voltajes/frecuencia validos). Sin limite de tiempo urgente aca.",
+            )
+            r = self._auto_wait_for("relay_56k", 1, timeout_s=600, poll_s=0.2)
+            if r == "cancel":
+                self._auto_set("idle", "Cancelado por el operador.")
+                return
+            if r == "fault":
+                self._auto_abort("fault_out activo mientras se esperaba READY.")
+                return
+            if r == "timeout":
+                self._auto_abort("Timeout (10 min) esperando relay_56k=1. Revisar Ponovo/medicion en la PZ.")
+                return
+
+            self._auto_set(
+                "wait_start",
+                "LISTO -- PRESIONA START AHORA EN LA PANTALLA DE LA PZ. "
+                "En cuanto se detecte, esta pagina dispara el resto solo.",
+            )
+            r = self._auto_wait_for("motor_run", 1, timeout_s=600, poll_s=0.05)
+            if r == "cancel":
+                self._auto_set("idle", "Cancelado por el operador.")
+                return
+            if r == "fault":
+                self._auto_abort("fault_out activo mientras se esperaba START.")
+                return
+            if r == "timeout":
+                self._auto_abort("Timeout (10 min) esperando START (motor_run=1).")
+                return
+
+            self._auto_set("full_volts", "START detectado. Aplicando full_volts...")
+            with self.lock:
+                self.hil.write("full_volts", 1)
+
+            self._auto_set("discharge", "Aplicando corriente de descarga y arrancando el tren de pulsos...")
+            with self.lock:
+                self.hil.write("discharge_current_present", 1)
+                if not self.pulse_running:
+                    self.pulse_running = True
+                    self.pulse_level = 0
+                    self.pulse_thread = threading.Thread(target=self.pulse_loop, daemon=True)
+                    self.pulse_thread.start()
+
+            self._auto_set("discharge_wait", "Esperando que la frecuencia de descarga se valide (~900ms)...")
+            r = self._auto_hold(0.9)
+            if r == "cancel":
+                self._auto_set("idle", "Cancelado por el operador.")
+                return
+            if r == "fault":
+                self._auto_abort("fault_out activo durante la etapa de descarga (revisar fault_code en la PZ).")
+                return
+
+            self._auto_set("field", "Aplicando corriente de campo (field_current_present)...")
+            with self.lock:
+                self.hil.write("field_current_present", 1)
+
+            self._auto_set("field_wait", "Esperando verificacion de campo (~1.5s)...")
+            r = self._auto_hold(1.5)
+            if r == "cancel":
+                self._auto_set("idle", "Cancelado por el operador.")
+                return
+            if r == "fault":
+                self._auto_abort("fault_out activo durante verificacion de campo.")
+                return
+
+            self._auto_set("sync", "Campo verificado. Aplicando sincronismo (motor_synchronized)...")
+            with self.lock:
+                self.hil.write("motor_synchronized", 1)
+
+            self._auto_set("verify_running", "Verificando RUNNING (relay_fax)...")
+            r = self._auto_wait_for("relay_fax", 1, timeout_s=5, poll_s=0.1)
+            if r == "fault":
+                self._auto_abort("fault_out activo al verificar RUNNING.")
+                return
+            if r == "ok":
+                self._auto_set("done", "RUNNING CONFIRMADO (relay_fax=1). Secuencia completa.")
+            else:
+                self._auto_set(
+                    "done_unconfirmed",
+                    "Secuencia completa pero relay_fax no confirmo en 5s -- revisar manualmente en la PZ.",
+                )
+        except Exception as exc:  # noqa: BLE001 -- last-resort guard so a bug here always leaves the plant safe
+            self._auto_abort(f"Error inesperado en la secuencia automatica: {exc}")
+        finally:
+            with self.lock:
+                self.auto_active = False
 
 
 def html_page() -> bytes:
@@ -208,10 +399,23 @@ def html_page() -> bytes:
     .checks label {{ display: block; margin: 8px 0; }}
     .status {{ padding: 10px; border-radius: 6px; background: var(--soft); margin-top: 10px; min-height: 42px; }}
     footer {{ max-width: 1280px; margin: 0 auto; padding: 12px 18px 24px; color: #4b5563; font-size: 13px; }}
+    .auto-banner {{ grid-column: 1 / -1; }}
+    .auto-message {{ font-size: 22px; font-weight: 800; padding: 22px; border-radius: 8px; text-align: center; background: #eef2f4; color: #202124; transition: background 0.3s, color 0.3s; }}
+    .auto-message.state-wait {{ background: #1d4ed8; color: white; }}
+    .auto-message.state-action {{ background: #b45309; color: white; animation: autoPulse 1s infinite alternate; }}
+    .auto-message.state-progress {{ background: #0369a1; color: white; }}
+    .auto-message.state-done {{ background: var(--green-dark); color: white; }}
+    .auto-message.state-failed {{ background: var(--danger); color: white; }}
+    @keyframes autoPulse {{ from {{ opacity: 1; }} to {{ opacity: 0.65; }} }}
+    .auto-actions {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }}
+    .auto-start {{ background: #7c3aed; }}
+    .auto-cancel {{ background: #6b7280; }}
+    .auto-actions button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
     @media (max-width: 900px) {{
       main {{ grid-template-columns: 1fr; }}
       .grid {{ grid-template-columns: 1fr; }}
       .actions {{ grid-template-columns: 1fr; }}
+      .auto-actions {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -226,6 +430,14 @@ def html_page() -> bytes:
     </div>
   </header>
   <main>
+    <section class="auto-banner">
+      <h2>Secuencia Automatica Guiada</h2>
+      <div class="auto-message" id="autoMessage">Presiona ARMAR abajo, despues INICIAR SECUENCIA AUTOMATICA.</div>
+      <div class="auto-actions">
+        <button class="action auto-start" id="autoStartBtn">INICIAR SECUENCIA AUTOMATICA</button>
+        <button class="action auto-cancel" id="autoCancelBtn" disabled>CANCELAR SECUENCIA</button>
+      </div>
+    </section>
     <section>
       <h2>Raspberry -> PZ</h2>
       <div class="actions">
@@ -270,6 +482,21 @@ def html_page() -> bytes:
       el.classList.toggle('fault', fault);
       el.querySelector('strong').textContent = value == null ? '-' : value;
     }}
+    const AUTO_STATE_CLASS = {{
+      idle: '', starting: 'state-progress', ready: 'state-progress',
+      wait_relay56k: 'state-wait', wait_start: 'state-action',
+      full_volts: 'state-progress', discharge: 'state-progress', discharge_wait: 'state-progress',
+      field: 'state-progress', field_wait: 'state-progress', sync: 'state-progress',
+      verify_running: 'state-progress', done: 'state-done', done_unconfirmed: 'state-done',
+      failed: 'state-failed'
+    }};
+    function paintAuto(auto) {{
+      const el = document.getElementById('autoMessage');
+      el.textContent = auto.message;
+      el.className = 'auto-message ' + (AUTO_STATE_CLASS[auto.step] || '');
+      document.getElementById('autoStartBtn').disabled = auto.active;
+      document.getElementById('autoCancelBtn').disabled = !auto.active;
+    }}
     async function refresh() {{
       try {{
         const res = await fetch('/api/status');
@@ -292,6 +519,7 @@ def html_page() -> bytes:
           ? `discharge_extinction_pulse PULSE ON (${{s.pulse.hz}} Hz)`
           : `discharge_extinction_pulse PULSE OFF (${{s.pulse.hz}} Hz)`;
         document.getElementById('pulseBtn').dataset.running = s.pulse.running ? '1' : '0';
+        paintAuto(s.auto);
       }} catch (err) {{
         setMessage('Sin conexion con servicio HIL: ' + err);
       }}
@@ -332,8 +560,18 @@ def html_page() -> bytes:
         refresh();
       }};
     }}
+    document.getElementById('autoStartBtn').onclick = async () => {{
+      const out = await api('/api/auto/start');
+      if (!out.ok) setMessage(out.message);
+      refresh();
+    }};
+    document.getElementById('autoCancelBtn').onclick = async () => {{
+      const out = await api('/api/auto/cancel');
+      setMessage(out.message);
+      refresh();
+    }};
     refresh();
-    setInterval(refresh, 500);
+    setInterval(refresh, 250);
   </script>
 </body>
 </html>"""
@@ -397,6 +635,10 @@ def make_handler(app: HilWebApp):
                     json_response(self, app.safe_stop())
                 elif parsed.path == "/api/pulse":
                     json_response(self, app.toggle_pulse(bool(body.get("running", False))))
+                elif parsed.path == "/api/auto/start":
+                    json_response(self, app.auto_start())
+                elif parsed.path == "/api/auto/cancel":
+                    json_response(self, app.auto_cancel_request())
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
             except Exception as exc:

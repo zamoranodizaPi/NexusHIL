@@ -169,6 +169,21 @@ Si despues de un intento de POST la PZ responde ping pero el puerto 80 queda cer
 
 ## Secuencia para llegar a RUNNING
 
+**Metodo recomendado (2026-08-11 en adelante): usar la Secuencia Automatica Guiada de
+la web del HIL en vez de seguir estos pasos a mano.** Los pasos manuales de abajo
+tienen ventanas de tiempo reales de la PZ (100ms a 12s segun la etapa) que un operador
+coordinando por chat/radio con la persona en el banco no puede cumplir de forma
+confiable -- confirmado en banco. La web ahora tiene un boton "INICIAR SECUENCIA
+AUTOMATICA" que corre todo el timing localmente en la Raspberry (sin depender de red
+ni de un tercero) y va mostrando en pantalla grande que hacer en cada momento
+("PRESIONA START AHORA", etc.). Ver el detalle tecnico de como funciona en "Secuencia
+exacta verificada en banco" mas abajo, y el codigo en
+`tools/rpi_digital_hil/nexus_sync_rpi_digital_hil_web.py` (metodo `_auto_run`).
+
+Los pasos manuales de aca abajo siguen sirviendo como referencia de que hace cada
+etapa y por que, y como plan B si por algun motivo la secuencia automatica no esta
+disponible.
+
 ### Paso 1 - Medicion analogica estable
 
 1. En Ponovo, dejar corrientes Ia/Ib/Ic/CH6/CH7 en 0 A.
@@ -186,8 +201,14 @@ Si despues de un intento de POST la PZ responde ping pero el puerto 80 queda cer
 
 En la interfaz web Raspberry:
 
-1. Presionar `ARMAR` si todavia esta desarmado.
-2. Presionar `READY`.
+1. **Presionar `SAFE_STOP` primero, siempre, incluso si es el primer intento del
+   dia** -- la Raspberry no pierde su estado cuando la PZ se reinicia sola, asi que
+   una salida que quedo en `ON` de un intento anterior (`full_volts`,
+   `discharge_current_present`, `field_current_present`, `motor_synchronized`) puede
+   disparar `fault_code=1 DC_BEFORE_START` apenas se de START. Confirmar que las 6
+   salidas de esa lista quedaron en `OFF` antes de seguir.
+2. Presionar `ARMAR`.
+3. Presionar `READY`.
 3. Confirmar:
    - `thermal_ok_in = ON`
    - `exciter_ready = ON`
@@ -300,9 +321,23 @@ Vab/Vbc/Vca balanceados a 60 Hz, corrientes Ia/Ib/Ic en 0 A. Confirmar
 `signal_present=true`, `freq_valid=true`, `sync_reference_ok=true` en
 `http://192.168.1.50/api/measurement/status`.
 
-### 2. ARMAR + READY (web HIL)
+### 2. SAFE_STOP primero (SIEMPRE, antes de cada intento nuevo), despues ARMAR + READY
+
+**Error real que paso en banco:** la Raspberry no se reinicia cuando se reinicia la
+PZ -- son equipos separados. Si el intento anterior llego a `full_volts`,
+`discharge_current_present`, `field_current_present` o `motor_synchronized` en `1` y
+nunca se hizo `SAFE_STOP`, esas salidas SIGUEN en `1` del lado de la Raspberry aunque
+la PZ se haya apagado y prendido de nuevo. Al dar START con `field_current_present`
+ya en `1` mientras la PZ todavia esta en `INIT`, el RTL dispara
+`fault_code=1 DC_BEFORE_START` de inmediato. Por eso `SAFE_STOP` va SIEMPRE primero,
+no solo como reaccion a una falla -- confirmar que las 6 salidas quedaron en `0` antes
+de tocar `ARMAR`:
 
 ```powershell
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/safe_stop" -Method POST -Body "{}" -ContentType "application/json"
+# Confirmar que outputs_to_pz quedo todo en 0 salvo thermal_ok_in/exciter_ready:
+Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/status" -UseBasicParsing
+
 $armBody = @{ gnd=$true; no_5v=$true; power_disabled=$true; series_resistors=$true } | ConvertTo-Json
 Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/arm" -Method POST -Body $armBody -ContentType "application/json"
 Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/ready" -Method POST -Body "{}" -ContentType "application/json"
@@ -311,6 +346,16 @@ Invoke-WebRequest -Uri "http://192.168.1.120:8080/api/ready" -Method POST -Body 
 Confirmar `relay_56k:true` en `http://192.168.1.50/status`.
 
 ### 3. START -- fisico, en el HMI de la PZ
+
+**Punto de falla real #4:** `ST_START_DETECTED` tiene una ventana de
+`incomplete_sequence_timeout_ms=12000ms` (12s) para recibir `full_volts` antes de
+disparar `fault_code=10 INCOMPLETE_SEQ`. 12 segundos suena generoso, pero si quien
+opera el HIL esta en otra ubicacion (por ejemplo coordinando por chat/radio con la
+persona que aprieta START en el banco), el tiempo entre "ya di START" y que la orden
+de `full_volts` efectivamente salga puede comerse esa ventana sin que parezca que paso
+tanto tiempo. Minimizar esa demora: tener el comando de `full_volts` (Paso 4/5, mas
+abajo) listo para ejecutar ANTES de que la persona en el banco de START, y dispararlo
+apenas se confirme `motor_run:true` -- no como una accion separada mas tarde.
 
 La persona en el banco toca START en la pantalla. Confirmar `motor_run:true` en
 `/status` (`fsm_state` pasa a `2`).
