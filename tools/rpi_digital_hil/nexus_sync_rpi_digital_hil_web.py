@@ -134,21 +134,49 @@ class HilWebApp:
         with self.lock:
             if not self.armed:
                 return {"ok": False, "message": "Primero confirma seguridad y arma el sistema"}
-            if run and not self.pulse_running:
-                self.pulse_running = True
-                self.pulse_level = 0
-                self.pulse_thread = threading.Thread(target=self.pulse_loop, daemon=True)
-                self.pulse_thread.start()
+        if run:
+            self.restart_pulse_thread_safe()
+            with self.lock:
                 self.last_message = "Tren discharge_extinction_pulse iniciado"
-            elif not run:
-                self.stop_pulse_locked()
-                self.last_message = "Tren discharge_extinction_pulse detenido"
+                return {"ok": True, "message": self.last_message}
+        with self.lock:
+            self.stop_pulse_locked()
+            self.last_message = "Tren discharge_extinction_pulse detenido"
             return {"ok": True, "message": self.last_message}
 
     def stop_pulse_locked(self) -> None:
         self.pulse_running = False
         self.pulse_level = 0
         self.hil.write("discharge_extinction_pulse", 0)
+
+    def restart_pulse_thread_safe(self) -> None:
+        """Ensures exactly one live pulse_loop thread going forward.
+
+        Real bug this fixes: the old start logic only checked the
+        self.pulse_running *flag*, not whether a thread was actually
+        alive. If that flag was ever left stale True (e.g. the PZ got
+        power-cycled/reflashed independently but this Raspberry's own
+        Python process kept running from an earlier test), a later
+        "start pulse" call would see pulse_running=True and skip spawning
+        a thread entirely -- discharge_extinction_pulse then stayed
+        frozen at whatever level it was last left at, the PZ's frequency
+        estimator never saw a single edge, and the discharge stage failed
+        every time with discharge_freq_mhz stuck at 0. Always stop-and-join
+        whatever thread actually exists (regardless of the flag) before
+        starting a fresh one. Must be called WITHOUT self.lock held --
+        it joins a thread that itself needs the lock to notice the stop
+        and exit.
+        """
+        old_thread = self.pulse_thread
+        with self.lock:
+            self.pulse_running = False
+        if old_thread is not None and old_thread.is_alive():
+            old_thread.join(timeout=1.0)
+        with self.lock:
+            self.pulse_running = True
+            self.pulse_level = 0
+            self.pulse_thread = threading.Thread(target=self.pulse_loop, daemon=True)
+            self.pulse_thread.start()
 
     def pulse_loop(self) -> None:
         while True:
@@ -289,11 +317,7 @@ class HilWebApp:
             self._auto_set("discharge", "Aplicando corriente de descarga y arrancando el tren de pulsos...")
             with self.lock:
                 self.hil.write("discharge_current_present", 1)
-                if not self.pulse_running:
-                    self.pulse_running = True
-                    self.pulse_level = 0
-                    self.pulse_thread = threading.Thread(target=self.pulse_loop, daemon=True)
-                    self.pulse_thread.start()
+            self.restart_pulse_thread_safe()
 
             self._auto_set("discharge_wait", "Esperando que la frecuencia de descarga se valide (~900ms)...")
             r = self._auto_hold(0.9)
