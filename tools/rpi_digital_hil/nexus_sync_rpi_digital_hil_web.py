@@ -225,8 +225,19 @@ class HilWebApp:
             self.auto_step = step
             self.auto_message = message
 
-    def _auto_wait_for(self, name: str, value: int, timeout_s: float, poll_s: float = 0.1) -> str:
-        """Returns 'ok', 'timeout', 'cancel', or 'fault'."""
+    def _auto_wait_for(
+        self, name: str, value: int, timeout_s: float, poll_s: float = 0.1, watch_run: bool = False
+    ) -> str:
+        """Returns 'ok', 'timeout', 'cancel', 'fault', or (if watch_run) 'stopped'.
+
+        watch_run=True means: also abort if motor_run drops back to 0 while
+        we're waiting -- that only happens once the PZ leaves its own
+        start/run chain (see sync_control_fsm.v), which is exactly what a
+        STOP pressed on the PZ's own screen mid-sequence looks like from
+        here. Only pass True for waits that happen AFTER motor_run=1 was
+        already confirmed (never during wait_relay56k/wait_start, where
+        motor_run==0 is the normal starting condition).
+        """
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             with self.lock:
@@ -234,13 +245,17 @@ class HilWebApp:
                     return "cancel"
                 if self.hil.read("fault_out"):
                     return "fault"
+                if watch_run and not self.hil.read("motor_run"):
+                    return "stopped"
                 if self.hil.read(name) == value:
                     return "ok"
             time.sleep(poll_s)
         return "timeout"
 
-    def _auto_hold(self, seconds: float) -> str:
-        """Sleeps while watching for cancel/fault_out. Returns 'ok', 'cancel', or 'fault'."""
+    def _auto_hold(self, seconds: float, watch_run: bool = False) -> str:
+        """Sleeps while watching for cancel/fault_out (and optionally motor_run
+        dropping -- see _auto_wait_for's watch_run docstring). Returns 'ok',
+        'cancel', 'fault', or (if watch_run) 'stopped'."""
         deadline = time.time() + seconds
         while time.time() < deadline:
             with self.lock:
@@ -248,6 +263,8 @@ class HilWebApp:
                     return "cancel"
                 if self.hil.read("fault_out"):
                     return "fault"
+                if watch_run and not self.hil.read("motor_run"):
+                    return "stopped"
             time.sleep(0.02)
         return "ok"
 
@@ -257,6 +274,20 @@ class HilWebApp:
             self.hil.safe_stop()
             self.auto_step = "failed"
             self.auto_message = message + " Salidas bajadas a reposo (SAFE_STOP aplicado)."
+            self.last_message = self.auto_message
+
+    def _auto_stopped_by_pz(self, message: str) -> None:
+        """PZ left its start/run chain on its own (most likely STOP pressed
+        on its own screen), detected via motor_run dropping. Not a HIL
+        failure -- release the simulated plant signals (field_current_present
+        / discharge_current_present) so the PZ's own ST_STOPPING can finish
+        transitioning back to ST_INIT (sync_control_fsm.v: ST_STOPPING waits
+        on !field_current_sync && !discharge_sync). Stays armed."""
+        with self.lock:
+            self.stop_pulse_locked()
+            self.hil.safe_stop()
+            self.auto_step = "stopped"
+            self.auto_message = message + " Senales de planta bajadas a reposo automaticamente."
             self.last_message = self.auto_message
 
     def auto_start(self) -> Dict[str, Any]:
@@ -330,12 +361,15 @@ class HilWebApp:
             self.restart_pulse_thread_safe()
 
             self._auto_set("discharge_wait", "Esperando que la frecuencia de descarga se valide (~900ms)...")
-            r = self._auto_hold(0.9)
+            r = self._auto_hold(0.9, watch_run=True)
             if r == "cancel":
                 self._auto_set("idle", "Cancelado por el operador.")
                 return
             if r == "fault":
                 self._auto_abort("fault_out activo durante la etapa de descarga (revisar fault_code en la PZ).")
+                return
+            if r == "stopped":
+                self._auto_stopped_by_pz("La PZ salio de su secuencia de arranque (motor_run=0) durante la descarga.")
                 return
 
             self._auto_set("field", "Aplicando corriente de campo (field_current_present)...")
@@ -343,12 +377,15 @@ class HilWebApp:
                 self.hil.write("field_current_present", 1)
 
             self._auto_set("field_wait", "Esperando verificacion de campo (~1.5s)...")
-            r = self._auto_hold(1.5)
+            r = self._auto_hold(1.5, watch_run=True)
             if r == "cancel":
                 self._auto_set("idle", "Cancelado por el operador.")
                 return
             if r == "fault":
                 self._auto_abort("fault_out activo durante verificacion de campo.")
+                return
+            if r == "stopped":
+                self._auto_stopped_by_pz("La PZ salio de su secuencia de arranque (motor_run=0) durante la verificacion de campo.")
                 return
 
             self._auto_set("sync", "Campo verificado. Aplicando sincronismo (motor_synchronized)...")
@@ -356,9 +393,12 @@ class HilWebApp:
                 self.hil.write("motor_synchronized", 1)
 
             self._auto_set("verify_running", "Verificando RUNNING (relay_fax)...")
-            r = self._auto_wait_for("relay_fax", 1, timeout_s=5, poll_s=0.1)
+            r = self._auto_wait_for("relay_fax", 1, timeout_s=5, poll_s=0.1, watch_run=True)
             if r == "fault":
                 self._auto_abort("fault_out activo al verificar RUNNING.")
+                return
+            if r == "stopped":
+                self._auto_stopped_by_pz("La PZ salio de su secuencia de arranque (motor_run=0) antes de confirmar RUNNING.")
                 return
             if r == "ok":
                 self._auto_set("done", "RUNNING CONFIRMADO (relay_fax=1). Secuencia completa.")
@@ -372,6 +412,44 @@ class HilWebApp:
         finally:
             with self.lock:
                 self.auto_active = False
+
+    def plant_sync_watchdog(self) -> None:
+        """Keeps the simulated plant signals synchronized with the PZ after
+        a successful guided sequence, for as long as this process runs.
+
+        Only watches while auto_step is 'done'/'done_unconfirmed' -- i.e.
+        strictly after the guided sequence declared RUNNING -- so it never
+        fights manual signal toggles made through the diagnostics panel
+        (those only happen with auto_step at 'idle', or after an abort put
+        it at 'failed'/'stopped', neither of which this loop touches).
+
+        Without this, stopping the motor from the PZ's own screen drops
+        motor_run/relay_fax immediately (see sync_control_fsm.v), but the
+        HIL keeps holding field_current_present/discharge_current_present
+        up -- and the PZ's own ST_STOPPING never finishes (it waits on
+        both of those going low), so it looks stuck instead of just
+        having stopped.
+        """
+        plant_outputs = (
+            "full_volts",
+            "discharge_current_present",
+            "field_current_present",
+            "motor_synchronized",
+            "discharge_extinction_pulse",
+        )
+        while True:
+            time.sleep(0.15)
+            with self.lock:
+                if self.auto_active or self.auto_step not in ("done", "done_unconfirmed"):
+                    continue
+                if not any(self.output_value(name) for name in plant_outputs):
+                    continue
+                if self.hil.read("motor_run"):
+                    continue
+                # self.lock is an RLock -- safe to re-enter from this same thread.
+                self._auto_stopped_by_pz(
+                    "La PZ salio de RUNNING (motor_run=0) -- probablemente STOP desde su propia pantalla."
+                )
 
 
 STEPPER_STEPS = (
@@ -468,7 +546,7 @@ def html_page() -> bytes:
     .step-dot.warn {{ background: var(--warn2); border-color: var(--warn2); color: var(--ink) }}
     @keyframes stepPulse {{ 0%,100% {{ box-shadow: 0 0 0 4px rgba(47,128,237,.2) }} 50% {{ box-shadow: 0 0 0 9px rgba(47,128,237,.05) }} }}
     .step-body {{ flex: 1; padding-top: 2px; opacity: .55 }}
-    .step-row.active .step-body, .step-row.done .step-body, .step-row.fault .step-body {{ opacity: 1 }}
+    .step-row.active .step-body, .step-row.done .step-body, .step-row.fault .step-body, .step-row.warn .step-body {{ opacity: 1 }}
     .step-label {{ font-weight: 700; font-size: 13.5px }}
     .step-sub {{ font-size: 11px; color: var(--muted2); margin-top: 2px; font-family: var(--font-mono) }}
     .step-row.fault .step-label {{ color: var(--fault2) }}
@@ -479,6 +557,7 @@ def html_page() -> bytes:
     @keyframes ctaGlow {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(255,215,75,.18) }} 50% {{ box-shadow: 0 0 0 7px rgba(255,215,75,.05) }} }}
     .cta.done {{ border-color: var(--green3) }}
     .cta.failed {{ border-color: var(--fault2) }}
+    .cta.stopped {{ border-color: var(--warn2) }}
 
     .checks {{ display: grid; gap: 8px; margin-bottom: 14px }}
     .checks label {{ display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px }}
@@ -631,6 +710,7 @@ def html_page() -> bytes:
       if (idx !== undefined) lastActiveIndex = idx;
       const isDoneFinal = auto.step === 'done' || auto.step === 'done_unconfirmed';
       const isFailed = auto.step === 'failed';
+      const isStopped = auto.step === 'stopped';
       for (let i = 0; i < STEP_LABELS.length; i++) {{
         const dot = document.getElementById('sdot-' + i);
         const row = document.getElementById('srow-' + i);
@@ -639,13 +719,15 @@ def html_page() -> bytes:
           state = armed ? 'done' : 'active';
         }} else if (isFailed && i === lastActiveIndex) {{
           state = 'fault';
+        }} else if (isStopped && i === lastActiveIndex) {{
+          state = 'warn';
         }} else if (isDoneFinal && i === 8) {{
           state = auto.step === 'done' ? 'done' : 'warn';
         }} else if (auto.active && idx !== undefined && i === idx) {{
           state = 'active';
         }} else if (idx !== undefined && i < idx) {{
           state = 'done';
-        }} else if (isFailed && i < lastActiveIndex) {{
+        }} else if ((isFailed || isStopped) && i < lastActiveIndex) {{
           state = 'done';
         }} else if (isDoneFinal && i < 8) {{
           state = 'done';
@@ -672,9 +754,9 @@ def html_page() -> bytes:
         if (auto.step === 'wait_start') runBox.classList.add('action-required');
         return;
       }}
-      if (auto.step === 'done' || auto.step === 'done_unconfirmed' || auto.step === 'failed') {{
+      if (auto.step === 'done' || auto.step === 'done_unconfirmed' || auto.step === 'failed' || auto.step === 'stopped') {{
         endBox.style.display = 'block';
-        endBox.className = 'cta ' + (auto.step === 'failed' ? 'failed' : 'done');
+        endBox.className = 'cta ' + (auto.step === 'failed' ? 'failed' : (auto.step === 'stopped' ? 'stopped' : 'done'));
         document.getElementById('ctaEndMsg').textContent = auto.message;
         return;
       }}
@@ -884,6 +966,7 @@ def main() -> int:
 
     try:
         hil.setup()
+        threading.Thread(target=app.plant_sync_watchdog, daemon=True).start()
         print(f"Nexus HIL web listening on http://{args.host}:{args.port}")
         server.serve_forever()
     finally:
