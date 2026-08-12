@@ -119,15 +119,25 @@ class HilWebApp:
             return {"ok": True, "message": self.last_message}
 
     def safe_stop(self) -> Dict[str, Any]:
+        """Always leaves the sequence view at a clean, unambiguous step 0.
+
+        Previously auto_step/auto_message only reset to idle when
+        auto_active was still True. If a sequence had already finished
+        (done/failed) and the operator pressed SAFE_STOP afterwards, the
+        physical outputs correctly went to reposo but the guided-sequence
+        stepper kept showing the old finished/failed state -- looked like
+        SAFE_STOP "did nothing". SAFE_STOP must unconditionally reset the
+        sequence view, regardless of whether a run was in progress.
+        """
         with self.lock:
             self.auto_cancel = True
             self.stop_pulse_locked()
             self.hil.safe_stop()
             self.armed = False
-            self.last_message = "SAFE_STOP aplicado; sistema desarmado"
-            if self.auto_active:
-                self.auto_step = "idle"
-                self.auto_message = "Detenido manualmente (SAFE_STOP)."
+            self.auto_active = False
+            self.auto_step = "idle"
+            self.auto_message = "Reiniciado a estado seguro. Listo para una nueva secuencia."
+            self.last_message = "SAFE_STOP aplicado; sistema reiniciado y desarmado"
             return {"ok": True, "message": self.last_message}
 
     def toggle_pulse(self, run: bool) -> Dict[str, Any]:
@@ -364,130 +374,249 @@ class HilWebApp:
                 self.auto_active = False
 
 
+STEPPER_STEPS = (
+    ("Seguridad", "Checklist + ARMAR"),
+    ("Reposo digital", "thermal_ok_in / exciter_ready"),
+    ("READY real de la PZ", "relay_56k = 1"),
+    ("START", "motor_run = 1 (fisico, en la PZ)"),
+    ("Full Volts", "full_volts = 1"),
+    ("Descarga", "discharge_current_present + tren de pulso"),
+    ("Campo", "field_current_present = 1"),
+    ("Sincronismo", "motor_synchronized = 1"),
+    ("RUNNING", "relay_fax = 1"),
+)
+
+
 def html_page() -> bytes:
-    controls = "\n".join(
+    manual_controls = "\n".join(
         f'<button class="signal" data-signal="{name}"><span>{name}</span><strong id="out-{name}">0</strong></button>'
         for name in REQUIRED_OUTPUTS
     )
-    inputs = "\n".join(
-        f'<div class="lamp" id="in-{name}"><span>{name}</span><strong>0</strong></div>'
+    input_chips = "\n".join(
+        f'<div class="chip" id="in-{name}"><span class="cdot"></span><span class="cname">{name}</span><span class="cval">0</span></div>'
         for name in REQUIRED_INPUTS
     )
-    optional = "\n".join(
-        f'<div class="lamp optional" id="opt-{name}"><span>{name}</span><strong>0</strong></div>'
+    optional_chips = "\n".join(
+        f'<div class="chip optional" id="opt-{name}"><span class="cdot"></span><span class="cname">{name}</span><span class="cval">0</span></div>'
         for name in ("field_pwm", "sync_pulse", "scr_gate_g1", "scr_gate_g2", "scr_gate_g3", "scr_gate_g4", "scr_gate_g5", "scr_gate_g6")
     )
+    stepper_rows = "\n".join(
+        f'<div class="step-row" id="srow-{i}"><span class="step-dot" id="sdot-{i}">{i}</span>'
+        f'<div class="step-body"><div class="step-label">{label}</div><div class="step-sub">{sub}</div></div></div>'
+        for i, (label, sub) in enumerate(STEPPER_STEPS)
+    )
+    steps_json = json.dumps([label for label, _sub in STEPPER_STEPS])
     html = f"""<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Nexus Sync Digital HIL Web</title>
+  <title>Nexus HIL &middot; SIEZA</title>
   <style>
     :root {{
-      --green: #9ed51d;
-      --green-dark: #3f7f16;
-      --charcoal: #2f3437;
-      --line: #d9dee3;
-      --soft: #f4f8ee;
-      --danger: #b3261e;
+      --green: #0b7a34; --green2: #12a052; --green3: #2fc274;
+      --bg: #101312; --ink: #0c0f0e; --panel: #1b1f1d; --panel2: #151817; --panel3: #212925;
+      --line: #2c332f; --line2: #3a433c; --text: #eef4f0; --muted: #9aa39e; --muted2: #7c8781;
+      --warn: #d6a700; --warn2: #ffd74b; --fault: #c9302c; --fault2: #ff8b88;
+      --blue: #2f80ed; --blue2: #8ec5ff; --ok2: #76e09a; --gray: #7a7f7c;
+      --radius: 9px; --shadow: 0 1px 0 rgba(255,255,255,.02) inset, 0 10px 26px -14px rgba(0,0,0,.55);
+      --font-body: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      --font-display: "Segoe UI Semibold", -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      --font-mono: ui-monospace, "Cascadia Code", "Consolas", "SFMono-Regular", Menlo, monospace;
     }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; font-family: Arial, sans-serif; background: #f7f8fa; color: #202124; }}
-    header {{ background: linear-gradient(90deg, var(--charcoal), #1f2a1f); color: white; border-bottom: 6px solid var(--green); padding: 16px 22px; }}
-    .brand {{ display: flex; align-items: center; gap: 16px; max-width: 1280px; margin: 0 auto; }}
-    .brand img {{ width: 82px; height: 82px; object-fit: contain; background: white; border-radius: 6px; padding: 5px; }}
-    h1 {{ margin: 0; font-size: 28px; }}
-    header p {{ margin: 6px 0 0; color: #eef6dd; }}
-    main {{ max-width: 1280px; margin: 0 auto; padding: 18px; display: grid; grid-template-columns: 1.25fr .95fr; gap: 16px; }}
-    section {{ background: white; border: 1px solid var(--line); border-radius: 6px; padding: 14px; }}
-    h2 {{ margin: 0 0 12px; color: var(--green-dark); border-bottom: 2px solid var(--soft); padding-bottom: 6px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
-    button {{ font: inherit; cursor: pointer; border-radius: 6px; border: 1px solid #b7c0c7; }}
-    button.signal {{ min-height: 78px; padding: 10px; text-align: left; background: #e5e7eb; display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
-    button.signal strong {{ min-width: 50px; text-align: center; padding: 8px; border-radius: 5px; background: #6b7280; color: white; }}
-    button.signal.on {{ background: #edf7d8; border-color: var(--green-dark); }}
-    button.signal.on strong {{ background: var(--green-dark); }}
-    .actions {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px; }}
-    .action {{ min-height: 58px; font-weight: 700; color: white; }}
-    .arm {{ background: var(--green-dark); }}
-    .ready {{ background: #2563eb; }}
-    .safe {{ background: var(--danger); }}
-    .pulse {{ width: 100%; min-height: 62px; margin-top: 10px; background: #0369a1; color: white; font-weight: 700; }}
-    .lamp {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; margin: 6px 0; background: #f3f4f6; }}
-    .lamp strong {{ min-width: 36px; text-align: center; border-radius: 4px; padding: 5px; color: white; background: #6b7280; }}
-    .lamp.on {{ background: #edf7d8; border-color: var(--green-dark); }}
-    .lamp.on strong {{ background: var(--green-dark); }}
-    .lamp.fault.on {{ background: #fdecec; border-color: var(--danger); }}
-    .lamp.fault.on strong {{ background: var(--danger); }}
-    .checks label {{ display: block; margin: 8px 0; }}
-    .status {{ padding: 10px; border-radius: 6px; background: var(--soft); margin-top: 10px; min-height: 42px; }}
-    footer {{ max-width: 1280px; margin: 0 auto; padding: 12px 18px 24px; color: #4b5563; font-size: 13px; }}
-    .auto-banner {{ grid-column: 1 / -1; }}
-    .auto-message {{ font-size: 22px; font-weight: 800; padding: 22px; border-radius: 8px; text-align: center; background: #eef2f4; color: #202124; transition: background 0.3s, color 0.3s; }}
-    .auto-message.state-wait {{ background: #1d4ed8; color: white; }}
-    .auto-message.state-action {{ background: #b45309; color: white; animation: autoPulse 1s infinite alternate; }}
-    .auto-message.state-progress {{ background: #0369a1; color: white; }}
-    .auto-message.state-done {{ background: var(--green-dark); color: white; }}
-    .auto-message.state-failed {{ background: var(--danger); color: white; }}
-    @keyframes autoPulse {{ from {{ opacity: 1; }} to {{ opacity: 0.65; }} }}
-    .auto-actions {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }}
-    .auto-start {{ background: #7c3aed; }}
-    .auto-cancel {{ background: #6b7280; }}
-    .auto-actions button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
-    @media (max-width: 900px) {{
-      main {{ grid-template-columns: 1fr; }}
-      .grid {{ grid-template-columns: 1fr; }}
-      .actions {{ grid-template-columns: 1fr; }}
-      .auto-actions {{ grid-template-columns: 1fr; }}
+    * {{ box-sizing: border-box }}
+    html, body {{ margin: 0; padding: 0 }}
+    body {{ font-family: var(--font-body); background: var(--bg); color: var(--text); font-size: 14.5px; line-height: 1.5; -webkit-font-smoothing: antialiased }}
+    h1, h2, h3, h4 {{ font-family: var(--font-display); margin: 0 }}
+    ::selection {{ background: var(--green2); color: #fff }}
+
+    .top {{
+      display: flex; align-items: center; gap: 16px; padding: 14px 22px;
+      background: linear-gradient(180deg, var(--ink), var(--bg)); border-bottom: 1px solid var(--line);
+      position: sticky; top: 0; z-index: 5;
+    }}
+    .top .logo-chip {{ width: 40px; height: 40px; border-radius: 8px; background: #fff; display: grid; place-items: center; flex: none; box-shadow: var(--shadow) }}
+    .top .logo-chip img {{ width: 30px; height: 30px; object-fit: contain }}
+    .top .brand-text h1 {{ font-size: 17px; letter-spacing: .06em; font-weight: 700 }}
+    .top .brand-text p {{ margin: 2px 0 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-weight: 600 }}
+    .top-right {{ margin-left: auto; display: flex; align-items: center; gap: 10px }}
+    .clock {{ font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums }}
+
+    .badge {{ display: inline-block; padding: 5px 9px; border-radius: 5px; font-size: 11.5px; font-weight: 700; border: 1px solid var(--line); letter-spacing: .03em }}
+    .badge.ok {{ background: #123920; color: var(--ok2); border-color: transparent }}
+    .badge.warn {{ background: #382f0d; color: var(--warn2); border-color: transparent }}
+    .badge.fault {{ background: #3b1514; color: var(--fault2); border-color: transparent }}
+    .badge.muted {{ color: var(--muted) }}
+
+    main {{ max-width: 1180px; margin: 0 auto; padding: 22px; display: grid; gap: 16px }}
+    .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px 20px }}
+    .panel h3 {{ font-size: 12.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700; margin: 0 0 14px }}
+
+    /* Guided sequence */
+    .stepper-v {{ display: flex; flex-direction: column }}
+    .step-row {{ display: flex; gap: 14px; padding: 9px 0; position: relative }}
+    .step-row:not(:last-child)::after {{ content: ''; position: absolute; left: 13px; top: 32px; bottom: -9px; width: 2px; background: var(--line) }}
+    .step-row.done:not(:last-child)::after {{ background: var(--green2) }}
+    .step-dot {{
+      width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--line); flex: none;
+      display: grid; place-items: center; font-size: 12px; font-weight: 700; color: var(--muted);
+      background: var(--panel2); position: relative; z-index: 1;
+    }}
+    .step-dot.active {{ background: var(--blue); border-color: var(--blue); color: #fff; animation: stepPulse 1.7s ease-in-out infinite }}
+    .step-dot.done {{ background: var(--green2); border-color: var(--green2); color: #fff }}
+    .step-dot.fault {{ background: var(--fault); border-color: var(--fault); color: #fff }}
+    .step-dot.warn {{ background: var(--warn2); border-color: var(--warn2); color: var(--ink) }}
+    @keyframes stepPulse {{ 0%,100% {{ box-shadow: 0 0 0 4px rgba(47,128,237,.2) }} 50% {{ box-shadow: 0 0 0 9px rgba(47,128,237,.05) }} }}
+    .step-body {{ flex: 1; padding-top: 2px; opacity: .55 }}
+    .step-row.active .step-body, .step-row.done .step-body, .step-row.fault .step-body {{ opacity: 1 }}
+    .step-label {{ font-weight: 700; font-size: 13.5px }}
+    .step-sub {{ font-size: 11px; color: var(--muted2); margin-top: 2px; font-family: var(--font-mono) }}
+    .step-row.fault .step-label {{ color: var(--fault2) }}
+
+    .cta {{ margin-top: 16px; padding: 16px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--panel2) }}
+    .cta .cta-msg {{ font-size: 14px; margin-bottom: 12px; color: var(--text) }}
+    .cta.action-required {{ border-color: var(--warn2); background: #2a2308; animation: ctaGlow 1.6s ease-in-out infinite }}
+    @keyframes ctaGlow {{ 0%,100% {{ box-shadow: 0 0 0 0 rgba(255,215,75,.18) }} 50% {{ box-shadow: 0 0 0 7px rgba(255,215,75,.05) }} }}
+    .cta.done {{ border-color: var(--green3) }}
+    .cta.failed {{ border-color: var(--fault2) }}
+
+    .checks {{ display: grid; gap: 8px; margin-bottom: 14px }}
+    .checks label {{ display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 13px }}
+    .checks input {{ width: 16px; height: 16px; accent-color: var(--green2) }}
+
+    button {{ font-family: var(--font-body); background: #203027; color: var(--text); border: 1px solid #375041; border-radius: 6px; padding: 10px 14px; cursor: pointer; font-size: 13.5px; font-weight: 600 }}
+    button:hover {{ border-color: var(--green2) }}
+    button:disabled {{ opacity: .4; cursor: not-allowed }}
+    .btn-row {{ display: flex; gap: 10px; flex-wrap: wrap }}
+    .btn-primary {{ background: var(--green); border-color: var(--green3); color: #fff; padding: 12px 18px; font-size: 14px }}
+    .btn-primary:hover {{ border-color: var(--green3) }}
+    .btn-danger {{ background: #3b1514; border-color: var(--fault); color: var(--fault2) }}
+    .btn-danger:hover {{ border-color: var(--fault2) }}
+    .btn-ghost {{ background: transparent; border-color: var(--line) }}
+
+    .safe-stop-dock {{ display: flex; justify-content: flex-end; align-items: center; gap: 12px }}
+    .safe-stop-hint {{ font-size: 11px; color: var(--muted2); text-align: right }}
+    .reset-toast {{
+      position: fixed; top: 18px; right: 18px; z-index: 20; padding: 12px 18px; border-radius: 7px;
+      background: var(--panel3); border: 1px solid var(--green3); color: var(--ok2); font-weight: 700;
+      font-size: 13px; box-shadow: var(--shadow); opacity: 0; transform: translateY(-8px);
+      transition: opacity .2s, transform .2s; pointer-events: none;
+    }}
+    .reset-toast.show {{ opacity: 1; transform: translateY(0) }}
+
+    /* Live status chips */
+    .chip-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 9px }}
+    .chip {{ display: flex; align-items: center; gap: 9px; padding: 10px 12px; border-radius: 7px; background: var(--panel2); border: 1px solid var(--line) }}
+    .chip .cdot {{ width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--gray) }}
+    .chip .cdot.on {{ background: var(--ok2); box-shadow: 0 0 0 3px rgba(118,224,154,.18) }}
+    .chip .cdot.on.fault {{ background: var(--fault2); box-shadow: 0 0 0 3px rgba(255,139,136,.22) }}
+    .chip .cname {{ font-size: 12px; font-weight: 600; font-family: var(--font-mono) }}
+    .chip .cval {{ margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--muted2) }}
+    .subgroup-label {{ font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted2); font-weight: 700; margin: 16px 0 8px }}
+    .subgroup-label:first-child {{ margin-top: 0 }}
+
+    /* Manual/diagnostics panel */
+    details.panel summary {{ cursor: pointer; list-style: none; display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 700 }}
+    details.panel summary::-webkit-details-marker {{ display: none }}
+    details.panel summary::after {{ content: '\\25be'; color: var(--muted2); font-size: 13px }}
+    details.panel[open] summary {{ margin-bottom: 14px }}
+    .manual-hint {{ font-size: 12px; color: var(--muted2); margin-bottom: 14px }}
+    .manual-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 9px; margin-bottom: 14px }}
+    button.signal {{ text-align: left; display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 12px }}
+    button.signal strong {{ min-width: 26px; text-align: center; padding: 3px 6px; border-radius: 4px; background: var(--panel3); color: var(--muted) }}
+    button.signal.on {{ border-color: var(--green3) }}
+    button.signal.on strong {{ background: var(--green2); color: #fff }}
+    .disabled-note {{ font-size: 11.5px; color: var(--warn2); margin-bottom: 10px }}
+
+    footer {{ max-width: 1180px; margin: 0 auto; padding: 6px 22px 30px; color: var(--muted2); font-size: 11.5px }}
+
+    @media (max-width: 640px) {{
+      .top {{ padding: 12px 14px }}
+      main {{ padding: 14px }}
     }}
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand">
-      <img src="/assets/branding/sieza_logo_light.png" alt="SIEZA">
-      <div>
-        <h1>Nexus Sync Digital HIL Web</h1>
-        <p>Control digital Raspberry Pi para pruebas HIL. Analogicas por Ponovo.</p>
-      </div>
+  <header class="top">
+    <div class="logo-chip"><img src="/assets/branding/sieza_logo_light.png" alt="SIEZA"></div>
+    <div class="brand-text">
+      <h1>NEXUS HIL</h1>
+      <p>Simulador digital &middot; Raspberry Pi</p>
+    </div>
+    <div class="top-right">
+      <span id="armedBadge" class="badge muted">DESARMADO</span>
+      <span id="conn" class="badge warn">CONECTANDO</span>
+      <span id="clock" class="clock">--:--:--</span>
     </div>
   </header>
   <main>
-    <section class="auto-banner">
-      <h2>Secuencia Automatica Guiada</h2>
-      <div class="auto-message" id="autoMessage">Presiona ARMAR abajo, despues INICIAR SECUENCIA AUTOMATICA.</div>
-      <div class="auto-actions">
-        <button class="action auto-start" id="autoStartBtn">INICIAR SECUENCIA AUTOMATICA</button>
-        <button class="action auto-cancel" id="autoCancelBtn" disabled>CANCELAR SECUENCIA</button>
+    <section class="panel">
+      <h3>Secuencia guiada</h3>
+      <div class="stepper-v">{stepper_rows}</div>
+
+      <div class="cta" id="ctaSecurity">
+        <div class="cta-msg">Confirma seguridad antes de armar el sistema.</div>
+        <div class="checks">
+          <label><input type="checkbox" id="gnd"> GND com&uacute;n conectado primero</label>
+          <label><input type="checkbox" id="no_5v"> No hay 5&nbsp;V en GPIO</label>
+          <label><input type="checkbox" id="power_disabled"> Potencia externa deshabilitada</label>
+          <label><input type="checkbox" id="series_resistors"> Resistencias serie/protecci&oacute;n instaladas</label>
+        </div>
+        <div class="btn-row"><button class="btn-primary" id="armBtn" disabled>ARMAR SISTEMA</button></div>
+      </div>
+
+      <div class="cta" id="ctaReady" style="display:none">
+        <div class="cta-msg">Sistema armado. Listo para iniciar la secuencia autom&aacute;tica.</div>
+        <div class="btn-row"><button class="btn-primary" id="autoStartBtn">INICIAR SECUENCIA AUTOM&Aacute;TICA</button></div>
+      </div>
+
+      <div class="cta" id="ctaRunning" style="display:none">
+        <div class="cta-msg" id="ctaRunningMsg">&nbsp;</div>
+        <div class="btn-row"><button class="btn-danger" id="autoCancelBtn">CANCELAR SECUENCIA</button></div>
+      </div>
+
+      <div class="cta" id="ctaEnd" style="display:none">
+        <div class="cta-msg" id="ctaEndMsg">&nbsp;</div>
+        <div class="btn-row"><button class="btn-primary" id="autoRetryBtn">REINICIAR SECUENCIA</button></div>
+      </div>
+
+      <p class="manual-hint" id="statusLine">Cargando...</p>
+      <div class="safe-stop-dock">
+        <span class="safe-stop-hint">Baja todas las salidas a reposo<br>y reinicia la secuencia al paso 0</span>
+        <button class="btn-danger" id="safeBtn">SAFE_STOP / REINICIAR</button>
       </div>
     </section>
-    <section>
-      <h2>Raspberry -> PZ</h2>
-      <div class="actions">
-        <button class="action arm" id="armBtn">ARMAR</button>
-        <button class="action ready" id="readyBtn">READY</button>
-        <button class="action safe" id="safeBtn">SAFE_STOP</button>
-      </div>
-      <div class="checks">
-        <label><input type="checkbox" id="gnd"> GND comun conectado primero</label>
-        <label><input type="checkbox" id="no_5v"> No hay 5 V en GPIO</label>
-        <label><input type="checkbox" id="power_disabled"> Potencia externa deshabilitada</label>
-        <label><input type="checkbox" id="series_resistors"> Resistencias serie/proteccion instaladas</label>
-      </div>
-      <div class="status" id="message">Cargando...</div>
-      <div class="grid">{controls}</div>
-      <button class="pulse" id="pulseBtn">discharge_extinction_pulse PULSE OFF</button>
+    <div class="reset-toast" id="resetToast">&#10003; Reiniciado a estado seguro (paso 0)</div>
+
+    <section class="panel">
+      <h3>Estado en vivo</h3>
+      <div class="subgroup-label">PZ &rarr; Raspberry</div>
+      <div class="chip-grid">{input_chips}</div>
+      <div class="subgroup-label">Monitoreo opcional</div>
+      <div class="chip-grid">{optional_chips}</div>
     </section>
-    <section>
-      <h2>PZ -> Raspberry</h2>
-      <div>{inputs}</div>
-      <h2>Monitoreo opcional</h2>
-      <div>{optional}</div>
-    </section>
+
+    <details class="panel manual-panel">
+      <summary>Modo manual / diagn&oacute;stico</summary>
+      <p class="manual-hint">Control directo de cada se&ntilde;al Raspberry&nbsp;&rarr;&nbsp;PZ. Uso normal: solo la secuencia guiada de arriba. Esto es para depuraci&oacute;n puntual (ver "Diagnostico si no entra READY" en la documentaci&oacute;n).</p>
+      <p class="disabled-note" id="manualDisabledNote" style="display:none">Deshabilitado mientras la secuencia autom&aacute;tica est&aacute; activa.</p>
+      <div class="manual-grid">{manual_controls}</div>
+      <div class="btn-row">
+        <button class="btn-ghost" id="readyBtn">Forzar READY</button>
+        <button class="btn-ghost" id="pulseBtn">discharge_extinction_pulse PULSE OFF</button>
+      </div>
+    </details>
   </main>
   <footer>{COPYRIGHT}</footer>
   <script>
+    const STEP_LABELS = {steps_json};
+    const AUTO_STEP_INDEX = {{
+      starting: 1, ready: 1, wait_relay56k: 2, wait_start: 3, full_volts: 4,
+      discharge: 5, discharge_wait: 5, field: 6, field_wait: 6, sync: 7,
+      verify_running: 8, done: 8, done_unconfirmed: 8
+    }};
+    let lastActiveIndex = 0;
+
     async function api(path, payload) {{
       const res = await fetch(path, {{
         method: 'POST',
@@ -496,82 +625,143 @@ def html_page() -> bytes:
       }});
       return await res.json();
     }}
-    function setMessage(text) {{
-      document.getElementById('message').textContent = text || '';
+
+    function paintStepper(auto, armed) {{
+      const idx = AUTO_STEP_INDEX[auto.step];
+      if (idx !== undefined) lastActiveIndex = idx;
+      const isDoneFinal = auto.step === 'done' || auto.step === 'done_unconfirmed';
+      const isFailed = auto.step === 'failed';
+      for (let i = 0; i < STEP_LABELS.length; i++) {{
+        const dot = document.getElementById('sdot-' + i);
+        const row = document.getElementById('srow-' + i);
+        let state = 'pending';
+        if (i === 0) {{
+          state = armed ? 'done' : 'active';
+        }} else if (isFailed && i === lastActiveIndex) {{
+          state = 'fault';
+        }} else if (isDoneFinal && i === 8) {{
+          state = auto.step === 'done' ? 'done' : 'warn';
+        }} else if (auto.active && idx !== undefined && i === idx) {{
+          state = 'active';
+        }} else if (idx !== undefined && i < idx) {{
+          state = 'done';
+        }} else if (isFailed && i < lastActiveIndex) {{
+          state = 'done';
+        }} else if (isDoneFinal && i < 8) {{
+          state = 'done';
+        }}
+        dot.className = 'step-dot ' + state;
+        row.className = 'step-row ' + state;
+        dot.textContent = state === 'done' ? '\\u2713' : (state === 'fault' ? '!' : String(i));
+      }}
     }}
-    function paintLamp(id, value, fault=false) {{
+
+    function paintCta(auto, armed) {{
+      const secBox = document.getElementById('ctaSecurity');
+      const readyBox = document.getElementById('ctaReady');
+      const runBox = document.getElementById('ctaRunning');
+      const endBox = document.getElementById('ctaEnd');
+      secBox.style.display = 'none'; readyBox.style.display = 'none';
+      runBox.style.display = 'none'; endBox.style.display = 'none';
+      runBox.classList.remove('action-required');
+
+      if (!armed) {{ secBox.style.display = 'block'; return; }}
+      if (auto.active) {{
+        runBox.style.display = 'block';
+        document.getElementById('ctaRunningMsg').textContent = auto.message;
+        if (auto.step === 'wait_start') runBox.classList.add('action-required');
+        return;
+      }}
+      if (auto.step === 'done' || auto.step === 'done_unconfirmed' || auto.step === 'failed') {{
+        endBox.style.display = 'block';
+        endBox.className = 'cta ' + (auto.step === 'failed' ? 'failed' : 'done');
+        document.getElementById('ctaEndMsg').textContent = auto.message;
+        return;
+      }}
+      readyBox.style.display = 'block';
+    }}
+
+    function paintChip(id, value, isFault) {{
       const el = document.getElementById(id);
       if (!el) return;
-      el.classList.toggle('on', !!value);
-      el.classList.toggle('fault', fault);
-      el.querySelector('strong').textContent = value == null ? '-' : value;
+      const dot = el.querySelector('.cdot');
+      dot.classList.toggle('on', !!value);
+      dot.classList.toggle('fault', !!value && isFault);
+      el.querySelector('.cval').textContent = value == null ? '-' : value;
     }}
-    const AUTO_STATE_CLASS = {{
-      idle: '', starting: 'state-progress', ready: 'state-progress',
-      wait_relay56k: 'state-wait', wait_start: 'state-action',
-      full_volts: 'state-progress', discharge: 'state-progress', discharge_wait: 'state-progress',
-      field: 'state-progress', field_wait: 'state-progress', sync: 'state-progress',
-      verify_running: 'state-progress', done: 'state-done', done_unconfirmed: 'state-done',
-      failed: 'state-failed'
-    }};
-    function paintAuto(auto) {{
-      const el = document.getElementById('autoMessage');
-      el.textContent = auto.message;
-      el.className = 'auto-message ' + (AUTO_STATE_CLASS[auto.step] || '');
-      document.getElementById('autoStartBtn').disabled = auto.active;
-      document.getElementById('autoCancelBtn').disabled = !auto.active;
+
+    function checksComplete() {{
+      return ['gnd', 'no_5v', 'power_disabled', 'series_resistors']
+        .every(id => document.getElementById(id).checked);
     }}
+    for (const id of ['gnd', 'no_5v', 'power_disabled', 'series_resistors']) {{
+      document.getElementById(id).addEventListener('change', () => {{
+        document.getElementById('armBtn').disabled = !checksComplete();
+      }});
+    }}
+
     async function refresh() {{
       try {{
         const res = await fetch('/api/status');
         const s = await res.json();
-        setMessage((s.armed ? 'ARMADO - ' : 'DESARMADO - ') + s.message);
+        document.getElementById('conn').className = 'badge ok';
+        document.getElementById('conn').textContent = 'CONECTADO';
+        document.getElementById('armedBadge').className = 'badge ' + (s.armed ? 'ok' : 'muted');
+        document.getElementById('armedBadge').textContent = s.armed ? 'ARMADO' : 'DESARMADO';
+        document.getElementById('statusLine').textContent = s.message;
+
         for (const [name, value] of Object.entries(s.outputs_to_pz)) {{
           const btn = document.querySelector(`[data-signal="${{name}}"]`);
           if (btn) {{
             btn.classList.toggle('on', !!value);
             btn.querySelector('strong').textContent = value;
+            btn.disabled = !s.armed || s.auto.active;
           }}
         }}
         for (const [name, value] of Object.entries(s.inputs_from_pz)) {{
-          paintLamp(`in-${{name}}`, value, name === 'fault_out');
+          paintChip(`in-${{name}}`, value, name === 'fault_out');
         }}
         for (const [name, value] of Object.entries(s.optional_inputs_from_pz)) {{
-          paintLamp(`opt-${{name}}`, value, false);
+          paintChip(`opt-${{name}}`, value, false);
         }}
+        document.getElementById('manualDisabledNote').style.display = s.auto.active ? 'block' : 'none';
+
         document.getElementById('pulseBtn').textContent = s.pulse.running
           ? `discharge_extinction_pulse PULSE ON (${{s.pulse.hz}} Hz)`
           : `discharge_extinction_pulse PULSE OFF (${{s.pulse.hz}} Hz)`;
         document.getElementById('pulseBtn').dataset.running = s.pulse.running ? '1' : '0';
-        paintAuto(s.auto);
+        document.getElementById('pulseBtn').disabled = !s.armed || s.auto.active;
+        document.getElementById('readyBtn').disabled = !s.armed || s.auto.active;
+        document.getElementById('armBtn').disabled = s.armed || !checksComplete();
+
+        paintStepper(s.auto, s.armed);
+        paintCta(s.auto, s.armed);
       }} catch (err) {{
-        setMessage('Sin conexion con servicio HIL: ' + err);
+        document.getElementById('conn').className = 'badge fault';
+        document.getElementById('conn').textContent = 'SIN CONEXION';
       }}
     }}
+
     document.getElementById('armBtn').onclick = async () => {{
-      const out = await api('/api/arm', {{
+      await api('/api/arm', {{
         gnd: document.getElementById('gnd').checked,
         no_5v: document.getElementById('no_5v').checked,
         power_disabled: document.getElementById('power_disabled').checked,
         series_resistors: document.getElementById('series_resistors').checked
       }});
-      setMessage(out.message);
       refresh();
     }};
-    document.getElementById('readyBtn').onclick = async () => {{
-      const out = await api('/api/ready');
-      setMessage(out.message);
-      refresh();
-    }};
+    document.getElementById('readyBtn').onclick = async () => {{ await api('/api/ready'); refresh(); }};
     document.getElementById('safeBtn').onclick = async () => {{
-      const out = await api('/api/safe_stop');
-      setMessage(out.message);
-      refresh();
+      await api('/api/safe_stop');
+      await refresh();
+      const toast = document.getElementById('resetToast');
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2200);
     }};
     document.getElementById('pulseBtn').onclick = async (ev) => {{
       const running = ev.currentTarget.dataset.running === '1';
-      const out = await api('/api/pulse', {{ running: !running }});
-      setMessage(out.message);
+      await api('/api/pulse', {{ running: !running }});
       refresh();
     }};
     for (const btn of document.querySelectorAll('button.signal')) {{
@@ -579,21 +769,19 @@ def html_page() -> bytes:
         const signal = btn.dataset.signal;
         const current = btn.classList.contains('on') ? 1 : 0;
         if (signal === 'plant_fault' && current === 0 && !confirm('Confirmar plant_fault=1')) return;
-        const out = await api('/api/output', {{ signal, value: current ? 0 : 1 }});
-        setMessage(out.message);
+        await api('/api/output', {{ signal, value: current ? 0 : 1 }});
         refresh();
       }};
     }}
-    document.getElementById('autoStartBtn').onclick = async () => {{
-      const out = await api('/api/auto/start');
-      if (!out.ok) setMessage(out.message);
-      refresh();
-    }};
-    document.getElementById('autoCancelBtn').onclick = async () => {{
-      const out = await api('/api/auto/cancel');
-      setMessage(out.message);
-      refresh();
-    }};
+    document.getElementById('autoStartBtn').onclick = async () => {{ await api('/api/auto/start'); refresh(); }};
+    document.getElementById('autoCancelBtn').onclick = async () => {{ await api('/api/auto/cancel'); refresh(); }};
+    document.getElementById('autoRetryBtn').onclick = async () => {{ await api('/api/auto/start'); refresh(); }};
+
+    function tickClock() {{
+      document.getElementById('clock').textContent = new Date().toLocaleTimeString('es-MX', {{ hour12: false }});
+    }}
+    tickClock();
+    setInterval(tickClock, 1000);
     refresh();
     setInterval(refresh, 250);
   </script>
